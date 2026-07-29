@@ -1,11 +1,12 @@
-data_dir = "data"
-scope_key = "splatrag-main"
+# Acceptance-test config. Kept separate from splatrag.toml so SciFact and the poison corpus can
+# never land in the personal memory scope — different data_dir AND different scope_key, because
+# either one alone would still share the other's store.
+data_dir = "data-cluster"
+scope_key = "splatrag-clustertest"
 
-# Local HNSW + Tantivy carry retrieval on their own. Qdrant on :6360 is not running; re-enable it
-# only when joining this store to the ~37k memories already embedded in that 4096-d collection.
 [qdrant]
 url = "http://127.0.0.1:6360"
-collection = "export-conversations"
+collection = "handshake-scifact"
 enabled = false
 
 [embedding]
@@ -13,8 +14,10 @@ url = "http://127.0.0.1:8081"
 model = "Qwen3-Embedding-8B-Q8_0.gguf"
 dimensions = 4096
 batch_size = 32
-timeout_seconds = 180
+timeout_seconds = 600
 
+# Basin labels are cosmetic and irrelevant to Recall@10/nDCG@10. Labeling every basin in a
+# 5k-document corpus with a local 4B model would dominate the runtime and change no metric.
 [labeling]
 url = "http://127.0.0.1:8082"
 model = "gemma-3-4b-it-q4_0.gguf"
@@ -48,5 +51,4 @@ min_basin_size = 3
 spatial_cell_size = 1.0
 
 [server]
-# 8765 is occupied by the running niodoo service; do not take it.
-bind = "127.0.0.1:8767"
+bind = "127.0.0.1:8766"
