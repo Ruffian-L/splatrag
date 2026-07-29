@@ -3,8 +3,8 @@
 !/data/.gitkeep
 /.env
 /models/
+/datasets/
 *.log
 *.tmp
 *.pid
 .DS_Store
-
