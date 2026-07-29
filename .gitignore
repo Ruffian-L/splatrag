@@ -1,0 +1,10 @@
+/target/
+/data/
+!/data/.gitkeep
+/.env
+/models/
+*.log
+*.tmp
+*.pid
+.DS_Store
+
