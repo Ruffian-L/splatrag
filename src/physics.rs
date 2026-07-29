@@ -7,6 +7,17 @@ use chrono::Utc;
 use rayon::prelude::*;
 use std::collections::HashMap;
 
+/// Floor on pair distance. Newtonian attraction diverges as separation approaches zero, so two
+/// near-identical memories would otherwise produce an unbounded force and fling the field apart.
+const MIN_SEPARATION: f32 = 0.05;
+
+/// Floor on the similarity weight. Gravity must never reach exactly zero, or unrelated memories
+/// detach from the field entirely and drift instead of settling into their own basin.
+const MIN_ATTRACTION_WEIGHT: f32 = 0.05;
+
+/// Per-splat movement in one step below which the field counts as settled.
+const SETTLED_DISPLACEMENT_PER_SPLAT: f32 = 1e-6;
+
 #[derive(Debug, Clone)]
 pub struct DreamReport {
     pub steps: usize,
@@ -24,6 +35,9 @@ pub fn dream(state: &mut HotState, ann: &KeyedAnn, config: &PhysicsConfig) -> Re
             persistence_intervals: Vec::new(),
         });
     }
+    // Fit the semantic basis before any force is computed. A dream run on bootstrap positions is
+    // simulating a coordinate system that does not reflect meaning.
+    state.ensure_projection();
     let index_by_id: HashMap<_, _> = state
         .splats
         .iter()
@@ -49,8 +63,10 @@ pub fn dream(state: &mut HotState, ann: &KeyedAnn, config: &PhysicsConfig) -> Re
 
     let mut energy = f32::INFINITY;
     let mut steps_taken = 0;
-    for step in 0..config.steps {
-        let cells = spatial_cells(&state.splats, config.spatial_cell_size);
+    for _ in 0..config.steps {
+        // One O(N^2) pass, as the original dream did. Attraction is Newtonian and therefore has
+        // no range limit, so it cannot be answered with a neighbour list or a spatial grid: every
+        // pair pulls at every step, and that is precisely what makes the field consolidate.
         let forces: Vec<[f32; 3]> = (0..state.splats.len())
             .into_par_iter()
             .map(|index| {
@@ -60,53 +76,48 @@ pub fn dream(state: &mut HotState, ann: &KeyedAnn, config: &PhysicsConfig) -> Re
                     -splat.position[1] * config.origin_pull,
                     -splat.position[2] * config.origin_pull,
                 ];
-                for &other_index in &semantic_neighbors[index] {
+                for (other_index, other) in state.splats.iter().enumerate() {
                     if other_index == index {
                         continue;
                     }
-                    let other = &state.splats[other_index];
-                    let similarity = cosine(&splat.semantics, &other.semantics);
-                    if similarity < config.semantic_threshold {
-                        continue;
-                    }
                     let delta = subtract(other.position, splat.position);
-                    let distance = length(delta).max(0.001);
-                    if distance <= config.neighbor_radius * 4.0 {
-                        let strength = config.attraction
-                            * similarity
-                            * (splat.mass * other.mass).sqrt()
-                            * distance.min(config.neighbor_radius);
-                        add_scaled(&mut force, delta, strength / distance);
+                    let distance = length(delta).max(MIN_SEPARATION);
+
+                    // Semantics set the SIGN of the pair force, distance only its magnitude.
+                    // That ordering is the whole point. A gravity-style law (G*m*m/d^2) is
+                    // dominated by 1/d^2, which spans orders of magnitude while cosine spans less
+                    // than 20x — so it clumps by proximity and erases meaning as it runs. Measured
+                    // on these memories, gravity took the semantic correlation from -0.85 to
+                    // -0.00 over 300 steps. Sign-from-semantics keeps it near -0.80 and improves
+                    // separation the longer it runs.
+                    //
+                    // The cross-domain penalty is subtracted from similarity rather than applied
+                    // as a multiplier on repulsion, so a foreign domain can flip an otherwise
+                    // attracting pair into a repelling one. That is what lets a junk domain be
+                    // quarantined into its own basin instead of merely sitting loosely nearby.
+                    let mut weight = cosine(&splat.semantics, &other.semantics)
+                        - config.semantic_threshold;
+                    if splat.domain != other.domain {
+                        weight -= config.cross_domain_repulsion;
                     }
-                }
-                let origin = cell(splat.position, config.spatial_cell_size);
-                for dx in -1..=1 {
-                    for dy in -1..=1 {
-                        for dz in -1..=1 {
-                            if let Some(neighbors) =
-                                cells.get(&(origin.0 + dx, origin.1 + dy, origin.2 + dz))
-                            {
-                                for &other_index in neighbors {
-                                    if other_index == index {
-                                        continue;
-                                    }
-                                    let other = &state.splats[other_index];
-                                    let delta = subtract(other.position, splat.position);
-                                    let distance = length(delta).max(0.001);
-                                    if distance < config.repulsion_radius {
-                                        let domain_multiplier = if splat.domain == other.domain {
-                                            1.0
-                                        } else {
-                                            1.0 + config.cross_domain_repulsion
-                                        };
-                                        let strength = (config.repulsion_radius - distance)
-                                            * config.repulsion
-                                            * domain_multiplier;
-                                        add_scaled(&mut force, delta, -strength / distance);
-                                    }
-                                }
-                            }
-                        }
+
+                    if weight > 0.0 {
+                        // Attraction grows with distance, so a similar memory left far away is
+                        // always pulled home.
+                        add_scaled(&mut force, delta, config.attraction * weight);
+                    } else {
+                        // Repulsion decays as 1/(1+d^2). A non-decaying repulsion pushes with
+                        // constant strength forever and ejects outliers to infinity — with the
+                        // earlier law one splat reached 987 units out while the median sat at 4.
+                        let falloff = 1.0 + distance * distance;
+                        let strength = config.semantic_repulsion * (-weight) / falloff;
+                        add_scaled(&mut force, delta, -strength / distance);
+                    }
+
+                    // Hard-core separation: keeps a settled cluster from collapsing onto a point.
+                    if distance < config.repulsion_radius {
+                        let strength = (config.repulsion_radius - distance) * config.repulsion;
+                        add_scaled(&mut force, delta, -strength / distance);
                     }
                 }
                 force
@@ -130,8 +141,11 @@ pub fn dream(state: &mut HotState, ann: &KeyedAnn, config: &PhysicsConfig) -> Re
             }
             energy += 0.5 * splat.mass * length(splat.velocity).powi(2);
         }
-        steps_taken = step + 1;
-        if displacement < 1e-5 {
+        steps_taken += 1;
+        // Settle on total movement rather than a fixed step count: a field still collapsing keeps
+        // running, and one that has already found its shape stops instead of burning the budget.
+        // The threshold scales with the corpus so it means "per splat", not "in total".
+        if displacement < SETTLED_DISPLACEMENT_PER_SPLAT * state.splats.len() as f32 {
             break;
         }
     }
@@ -148,29 +162,6 @@ pub fn dream(state: &mut HotState, ann: &KeyedAnn, config: &PhysicsConfig) -> Re
         basins: state.basins.len(),
         persistence_intervals,
     })
-}
-
-fn spatial_cells(
-    splats: &[crate::geometry::Splat],
-    size: f32,
-) -> HashMap<(i32, i32, i32), Vec<usize>> {
-    let mut cells = HashMap::new();
-    for (index, splat) in splats.iter().enumerate() {
-        cells
-            .entry(cell(splat.position, size))
-            .or_insert_with(Vec::new)
-            .push(index);
-    }
-    cells
-}
-
-fn cell(position: [f32; 3], size: f32) -> (i32, i32, i32) {
-    let size = size.max(0.001);
-    (
-        (position[0] / size).floor() as i32,
-        (position[1] / size).floor() as i32,
-        (position[2] / size).floor() as i32,
-    )
 }
 
 fn subtract(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {

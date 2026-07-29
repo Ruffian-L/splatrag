@@ -3,14 +3,14 @@ use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tantivy::collector::TopDocs;
-use tantivy::query::QueryParser;
+use tantivy::query::{BooleanQuery, Occur, Query, TermQuery};
 use tantivy::schema::{
     Field, IndexRecordOption, STORED, STRING, Schema, TextFieldIndexing, TextOptions,
 };
 use tantivy::tokenizer::{
     Language, LowerCaser, RemoveLongFilter, SimpleTokenizer, Stemmer, StopWordFilter, TextAnalyzer,
 };
-use tantivy::{Document, Index, IndexReader, ReloadPolicy, TantivyDocument, doc};
+use tantivy::{Document, Index, IndexReader, ReloadPolicy, TantivyDocument, Term, doc};
 use uuid::Uuid;
 
 /// Tantivy's default tokenizer only lowercases and splits. That leaves `blades` unable to match
@@ -134,18 +134,29 @@ impl LexicalIndex {
         if query.trim().is_empty() {
             return Ok(Vec::new());
         }
-        // A query made only of stopwords ("what is that?") analyzes down to zero terms, and
-        // tantivy reports that as a hard parse error. Propagating it would fail the whole recall
-        // including the semantic arm, which can still answer a vague question. No indexable terms
-        // simply means the lexical arm abstains.
-        if self.analyzed_term_count(query)? == 0 {
+        // Built from analyzed terms rather than QueryParser. Recall receives arbitrary prose —
+        // "alpha (+)- thalassemia", "RIGHT NOW: [REQUEST: LOCK]", "grok-4-1-non-thinking" — and
+        // QueryParser reads +, -, (), :, ", ^, ~ as operators, so real text raises a syntax error
+        // that fails the entire recall including the semantic arm. Going through the index
+        // analyzer removes that whole class of failure and guarantees query-time and index-time
+        // stemming cannot drift apart.
+        let terms = self.analyzed_terms(query)?;
+        // A query of only stopwords ("what is that?") analyzes to nothing. That is not an error:
+        // the lexical arm simply abstains and the semantic arm answers.
+        if terms.is_empty() {
             return Ok(Vec::new());
         }
         let searcher = self.reader.searcher();
-        let parser = QueryParser::for_index(&self.index, vec![self.text]);
-        let parsed = parser
-            .parse_query(query)
-            .with_context(|| format!("invalid lexical query {query:?}"))?;
+        let clauses = terms
+            .into_iter()
+            .map(|text| {
+                let term = Term::from_field_text(self.text, &text);
+                let query: Box<dyn Query> =
+                    Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs));
+                (Occur::Should, query)
+            })
+            .collect::<Vec<_>>();
+        let parsed = BooleanQuery::new(clauses);
         let results = searcher.search(&parsed, &TopDocs::with_limit(limit).order_by_score())?;
         let schema = self.index.schema();
         let mut hits = Vec::with_capacity(results.len());
@@ -166,20 +177,21 @@ impl LexicalIndex {
         Ok(hits)
     }
 
-    /// Number of terms the indexing analyzer actually produces for `query`, i.e. how much of it
-    /// survives stopword removal and stemming.
-    fn analyzed_term_count(&self, query: &str) -> Result<usize> {
+    /// The terms `query` reduces to under the same analyzer the index uses — i.e. what survives
+    /// stopword removal and stemming. Duplicates are kept so a repeated word carries the extra
+    /// weight it would under a parsed query.
+    fn analyzed_terms(&self, query: &str) -> Result<Vec<String>> {
         let mut analyzer = self
             .index
             .tokenizers()
             .get(TEXT_TOKENIZER)
             .context("memory tokenizer was not registered on this index")?;
         let mut stream = analyzer.token_stream(query);
-        let mut count = 0;
+        let mut terms = Vec::new();
         while stream.advance() {
-            count += 1;
+            terms.push(stream.token().text.clone());
         }
-        Ok(count)
+        Ok(terms)
     }
 
     pub fn path(&self) -> &Path {
@@ -227,6 +239,37 @@ mod tests {
             index.search("what is the", 10).unwrap().is_empty(),
             "an all-stopword query carries no signal and must not rank documents"
         );
+    }
+
+    /// Real prose reaches recall verbatim. Every one of these crashed the previous QueryParser
+    /// path with a syntax error that failed the whole recall, semantic arm included.
+    #[test]
+    fn query_syntax_characters_do_not_fail_recall() {
+        let temp = tempfile::tempdir().unwrap();
+        let index = LexicalIndex::open(temp.path().join("tantivy")).unwrap();
+        let record = MemoryRecord::new(
+            "test",
+            "one",
+            "homozygous alpha thalassemia trait raises anemia vulnerability",
+        );
+        index.add_records(std::slice::from_ref(&record)).unwrap();
+
+        for query in [
+            "A high microerythrocyte count raises vulnerability to severe anemia in \
+             homozygous alpha (+)- thalassemia trait subjects.",
+            "RIGHT NOW: [REQUEST: LOCK]",
+            "grok-4-1-non-thinking",
+            "sigma = s^2 I + (lambda - s^2) uu^T",
+            "\"unbalanced quote",
+            "trailing operator +",
+        ] {
+            index
+                .search(query, 10)
+                .unwrap_or_else(|error| panic!("query {query:?} failed: {error:#}"));
+        }
+
+        let hits = index.search("alpha (+)- thalassemia", 10).unwrap();
+        assert_eq!(hits[0].id, record.id, "punctuation must not suppress the match");
     }
 
     /// Reopening must re-register the analyzer or every subsequent search fails.

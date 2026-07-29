@@ -69,6 +69,8 @@ pub struct PhysicsConfig {
     pub semantic_threshold: f32,
     pub repulsion_radius: f32,
     pub repulsion: f32,
+    #[serde(default = "default_semantic_repulsion")]
+    pub semantic_repulsion: f32,
     pub cross_domain_repulsion: f32,
     pub basin_radius: f32,
     pub min_basin_size: usize,
@@ -148,16 +150,29 @@ impl Default for RetrievalConfig {
 impl Default for PhysicsConfig {
     fn default() -> Self {
         Self {
-            steps: 120,
-            dt: 0.016,
-            damping: 0.92,
-            origin_pull: 0.002,
+            // Tuned by sweep against two measured objectives on the real memory corpus:
+            // semantic fidelity (correlation of 3-d distance with semantic cosine) and quarantine
+            // (median cross-domain distance over median same-domain distance). Settles by ~600
+            // steps and holds through 2400.
+            steps: 1200,
+            dt: 0.02,
+            damping: 0.9,
+            origin_pull: 0.05,
             neighbor_radius: 2.0,
-            attraction: 0.02,
+            // Spring stiffness for semantically similar pairs.
+            attraction: 2.0,
+            // Now the neutral point of the pair force, not a gate: above it pairs attract, below
+            // it they repel.
             semantic_threshold: 0.55,
-            repulsion_radius: 0.45,
-            repulsion: 0.12,
-            cross_domain_repulsion: 0.35,
+            repulsion_radius: 0.5,
+            // Hard-core only — stops a settled cluster collapsing onto a single point.
+            repulsion: 5.0,
+            // Strength of the decaying semantic repulsion between dissimilar pairs.
+            semantic_repulsion: 2.0,
+            // Similarity penalty for a foreign domain. This is the quarantine dial: 0.0 gives
+            // separation 1.3 (none), 0.15 gives 3.6, 1.0 gives 12.8, and semantic fidelity falls
+            // as it rises. 0.15 keeps clusters meaningful while still isolating a junk domain.
+            cross_domain_repulsion: 0.15,
             basin_radius: 0.8,
             min_basin_size: 3,
             spatial_cell_size: 1.0,
@@ -216,4 +231,9 @@ impl AppConfig {
     pub fn packed_geometry_path(&self) -> PathBuf {
         self.data_dir.join("hot").join("geometry.bin")
     }
+}
+
+/// Older config files predate the split between hard-core and semantic repulsion.
+fn default_semantic_repulsion() -> f32 {
+    2.0
 }

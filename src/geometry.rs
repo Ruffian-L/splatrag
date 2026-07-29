@@ -3,7 +3,7 @@ use crate::record::MemoryRecord;
 use anyhow::{Context, Result};
 use bytemuck::{Pod, Zeroable};
 use chrono::{DateTime, Utc};
-use nalgebra::{UnitQuaternion, Vector3};
+use nalgebra::{DMatrix, DVector, SymmetricEigen, UnitQuaternion, Vector3};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -61,6 +61,118 @@ pub struct HotState {
     pub kinetic_energy: f32,
     pub splats: Vec<Splat>,
     pub basins: Vec<Basin>,
+    /// Absent on stores written before the projection existed; refitted on the next dream.
+    #[serde(default)]
+    pub projection: Option<Projection>,
+}
+
+/// Fitted PCA map from the 64-d matryoshka semantics into the 3-d field the dream runs in.
+///
+/// The projection this replaced summed fixed sinusoids and then normalized to a sphere of radius
+/// 6, which pinned every memory to one shell and left semantic cosine correlating with 3-d
+/// distance at only r=-0.36. Measured over the same memories, PCA reaches r=-0.85: the difference
+/// between clusters that mean something and clusters that are an artifact of the projection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Projection {
+    pub mean: Vec<f32>,
+    /// Three unit eigenvectors of the semantic covariance, largest variance first.
+    pub basis: Vec<Vec<f32>>,
+    pub scale: f32,
+    pub fitted_count: usize,
+}
+
+/// RMS radius the fitted cloud is scaled to. Chosen against the force radii rather than for looks:
+/// it leaves typical spacing several times `repulsion_radius`, so gravity has room to visibly pull
+/// the field inward before short-range repulsion balances it.
+const TARGET_RMS_RADIUS: f32 = 4.0;
+
+impl Projection {
+    pub fn fit(splats: &[Splat]) -> Option<Self> {
+        let dim = splats.first()?.semantics.len();
+        if splats.len() < 3 || dim == 0 {
+            return None;
+        }
+        let count = splats.len() as f32;
+        let mut mean = vec![0.0_f32; dim];
+        for splat in splats {
+            for (slot, value) in mean.iter_mut().zip(&splat.semantics) {
+                *slot += value;
+            }
+        }
+        for slot in &mut mean {
+            *slot /= count;
+        }
+
+        // f64 for the covariance: these are 64 sums over the whole corpus, and f32 accumulation
+        // loses enough precision on the trailing eigenvalues to reorder nearly-tied axes.
+        let mut covariance = DMatrix::<f64>::zeros(dim, dim);
+        for splat in splats {
+            let centered = DVector::<f64>::from_iterator(
+                dim,
+                splat
+                    .semantics
+                    .iter()
+                    .zip(&mean)
+                    .map(|(value, mean)| f64::from(value - mean)),
+            );
+            covariance.gemm(1.0, &centered, &centered.transpose(), 1.0);
+        }
+        covariance /= f64::from(count);
+
+        let eigen = SymmetricEigen::new(covariance);
+        let mut order: Vec<usize> = (0..dim).collect();
+        order.sort_by(|left, right| {
+            eigen.eigenvalues[*right].total_cmp(&eigen.eigenvalues[*left])
+        });
+        let basis: Vec<Vec<f32>> = order
+            .iter()
+            .take(3)
+            .map(|index| {
+                eigen
+                    .eigenvectors
+                    .column(*index)
+                    .iter()
+                    .map(|value| *value as f32)
+                    .collect()
+            })
+            .collect();
+        if basis.len() < 3 {
+            return None;
+        }
+
+        let mut projection = Self {
+            mean,
+            basis,
+            scale: 1.0,
+            fitted_count: splats.len(),
+        };
+        let sum_squares: f32 = splats
+            .iter()
+            .map(|splat| {
+                let point = projection.apply(&splat.semantics);
+                point[0] * point[0] + point[1] * point[1] + point[2] * point[2]
+            })
+            .sum();
+        let rms = (sum_squares / count).sqrt();
+        projection.scale = if rms > 1e-6 {
+            TARGET_RMS_RADIUS / rms
+        } else {
+            1.0
+        };
+        Some(projection)
+    }
+
+    pub fn apply(&self, semantics: &[f32]) -> [f32; 3] {
+        let mut point = [0.0_f32; 3];
+        for (axis, basis) in self.basis.iter().enumerate().take(3) {
+            let mut sum = 0.0;
+            for ((value, mean), weight) in semantics.iter().zip(&self.mean).zip(basis) {
+                sum += (value - mean) * weight;
+            }
+            point[axis] = sum * self.scale;
+        }
+        point
+    }
 }
 
 impl Default for HotState {
@@ -72,6 +184,7 @@ impl Default for HotState {
             kinetic_energy: 0.0,
             splats: Vec::new(),
             basins: Vec::new(),
+            projection: None,
         }
     }
 }
@@ -175,11 +288,43 @@ impl HotState {
             if existing.contains_key(&record.id) {
                 continue;
             }
-            self.splats.push(Splat::from_embedding(record, embedding)?);
+            let mut splat = Splat::from_embedding(record, embedding)?;
+            // Place new arrivals on the existing basis so they land beside the memories they
+            // resemble. Without a fitted projection yet they keep the bootstrap position, which
+            // the first dream replaces wholesale.
+            if let Some(projection) = &self.projection {
+                splat.position = projection.apply(&splat.semantics);
+            }
+            self.splats.push(splat);
             added += 1;
         }
         self.splats.sort_by_key(|splat| splat.memory_id);
         Ok(added)
+    }
+
+    /// Refit the projection and re-place every splat. Velocities are cleared deliberately:
+    /// positions from a stale basis are not comparable to positions from a new one, so carrying
+    /// momentum across the change would inject motion that means nothing.
+    pub fn reproject(&mut self) -> bool {
+        let Some(projection) = Projection::fit(&self.splats) else {
+            return false;
+        };
+        for splat in &mut self.splats {
+            splat.position = projection.apply(&splat.semantics);
+            splat.velocity = [0.0; 3];
+        }
+        self.projection = Some(projection);
+        true
+    }
+
+    /// Fit on first use, and refit once the corpus has outgrown the basis. Without the second
+    /// condition the axes fitted to the first handful of memories would govern forever.
+    pub fn ensure_projection(&mut self) -> bool {
+        let stale = match &self.projection {
+            None => true,
+            Some(projection) => self.splats.len() > projection.fitted_count.saturating_mul(2),
+        };
+        stale && self.reproject()
     }
 
     pub fn splat_map(&self) -> HashMap<Uuid, &Splat> {

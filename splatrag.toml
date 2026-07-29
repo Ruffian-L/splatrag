@@ -32,17 +32,18 @@ hnsw_ef_construction = 200
 hnsw_ef_search = 80
 
 [physics]
-steps = 120
-dt = 0.01600000075995922
-damping = 0.9200000166893005
-origin_pull = 0.0020000000949949026
+steps = 1200
+dt = 0.02
+damping = 0.9
+origin_pull = 0.05
 neighbor_radius = 2.0
-attraction = 0.019999999552965164
-semantic_threshold = 0.550000011920929
-repulsion_radius = 0.44999998807907104
-repulsion = 0.11999999731779099
-cross_domain_repulsion = 0.3499999940395355
-basin_radius = 0.800000011920929
+attraction = 2.0
+semantic_threshold = 0.55
+repulsion_radius = 0.5
+repulsion = 5.0
+semantic_repulsion = 2.0
+cross_domain_repulsion = 0.15
+basin_radius = 0.8
 min_basin_size = 3
 spatial_cell_size = 1.0
 
