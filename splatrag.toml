@@ -1,10 +1,12 @@
 data_dir = "data"
 scope_key = "splatrag-main"
 
+# Local HNSW + Tantivy carry retrieval on their own. Qdrant on :6360 is not running; re-enable it
+# only when joining this store to the ~37k memories already embedded in that 4096-d collection.
 [qdrant]
 url = "http://127.0.0.1:6360"
 collection = "export-conversations"
-enabled = true
+enabled = false
 
 [embedding]
 url = "http://127.0.0.1:8081"

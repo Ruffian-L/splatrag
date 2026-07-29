@@ -127,18 +127,22 @@ impl LabelingClient {
         if !self.config.enabled {
             anyhow::bail!("basin labeling is disabled");
         }
+        // 8 x 400 chars keeps the prompt near ~1k tokens, well inside a 4096-token server context
+        // with room for the reply. 12 x 700 could reach ~2.1k and crowd out the response budget.
         let evidence = representatives
             .iter()
-            .take(12)
+            .take(8)
             .enumerate()
-            .map(|(index, text)| format!("{}. {}", index + 1, truncate(text, 700)))
+            .map(|(index, text)| format!("{}. {}", index + 1, truncate(text, 400)))
             .collect::<Vec<_>>()
             .join("\n");
+        // The word cap is load-bearing: small local models write expansive summaries and run past
+        // max_tokens mid-object, which reaches the parser as unterminated JSON.
         let prompt = format!(
             "Name this AI-memory basin from its representative messages.\n\
              Return only JSON with string fields label, path, summary.\n\
              label: 2-6 concrete words. path: slash-separated hierarchy. \
-             summary: one sentence grounded in the messages.\n\n{evidence}"
+             summary: one sentence of at most 25 words, grounded in the messages.\n\n{evidence}"
         );
         let url = format!(
             "{}/v1/chat/completions",
@@ -166,7 +170,9 @@ fn label_request(model: &str, prompt: String) -> Value {
     serde_json::json!({
         "model": model,
         "temperature": 0.1,
-        "max_tokens": 180,
+        // Headroom for a complete JSON object. Too tight a budget truncates mid-object, which the
+        // parser can only report as malformed JSON rather than as the length limit it actually is.
+        "max_tokens": 512,
         // Gemma 4 enables thinking by default in llama.cpp. Basin labels are a
         // short structured task, so spending the response budget on hidden
         // reasoning can leave `message.content` empty.
@@ -185,10 +191,15 @@ pub struct BasinLabelDraft {
 fn parse_label_json(content: &str) -> Result<BasinLabelDraft> {
     let start = content
         .find('{')
-        .context("label response has no JSON object")?;
-    let end = content
-        .rfind('}')
-        .context("label response has no JSON terminator")?;
+        .with_context(|| format!("label response has no JSON object: {:?}", truncate(content, 200)))?;
+    // An opening brace with no closing one is the signature of a response cut off at max_tokens,
+    // so echo the tail — "malformed JSON" alone sends you looking in the wrong place.
+    let end = content.rfind('}').with_context(|| {
+        format!(
+            "label response was cut off before closing the JSON object (likely max_tokens): {:?}",
+            truncate(content, 200)
+        )
+    })?;
     let draft: BasinLabelDraft = serde_json::from_str(&content[start..=end])?;
     if draft.label.trim().is_empty() || draft.path.trim().is_empty() {
         anyhow::bail!("label response contains empty label or path");

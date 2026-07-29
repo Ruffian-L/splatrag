@@ -230,8 +230,13 @@ impl MemoryService {
             if representatives.is_empty() {
                 continue;
             }
-            let draft = self.labeler.label_basin(&representatives).await?;
-            labels.push((id, draft));
+            // Labels are derived, cosmetic metadata. A basin the local model fails to name stays
+            // `pending` and is retried next pass — one bad response must not discard the labels
+            // already earned in this run, nor fail a dream whose physics has already landed.
+            match self.labeler.label_basin(&representatives).await {
+                Ok(draft) => labels.push((id, draft)),
+                Err(error) => eprintln!("basin {id} left unlabeled: {error:#}"),
+            }
         }
         let count = labels.len();
         {

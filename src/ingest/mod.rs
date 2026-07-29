@@ -19,6 +19,7 @@ pub enum SourceKind {
     Gemini,
     AgentJsonl,
     SemanticMd,
+    MemoryMd,
     Jsonl,
 }
 
@@ -102,6 +103,7 @@ impl Ingestor {
                 self.ingest_jsonl(resolved, path, domain, report, emit)
             }
             SourceKind::SemanticMd => self.ingest_semantic_md(path, domain, report, emit),
+            SourceKind::MemoryMd => self.ingest_memory_md(path, domain, report, emit),
             SourceKind::Auto => unreachable!("auto source kind must be resolved"),
         }
     }
@@ -222,6 +224,44 @@ impl Ingestor {
         }
         if let Some((start, block)) = current {
             flush(start, block)?;
+        }
+        Ok(())
+    }
+
+    /// One memory file becomes exactly one record. These files are written one-fact-per-file by
+    /// design, so the file is already the natural retrieval unit — splitting them would break the
+    /// fact apart. `MEMORY.md` is skipped: it is an index of pointers to the others, and ingesting
+    /// it would create a record that weakly matches every query.
+    fn ingest_memory_md<F>(
+        &self,
+        path: &Path,
+        domain: &str,
+        report: &mut IngestReport,
+        emit: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(MemoryRecord) -> Result<()>,
+    {
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("MEMORY.md"))
+        {
+            return Ok(());
+        }
+
+        let mut raw = String::new();
+        BufReader::new(File::open(path)?).read_to_string(&mut raw)?;
+        report.source_items += 1;
+        match memory_md_record(path, &raw, domain) {
+            Ok(record) => {
+                emit(record)?;
+                report.emitted += 1;
+            }
+            Err(error) => {
+                report.rejected += 1;
+                self.quarantine(path, 1, &error.to_string())?;
+            }
         }
         Ok(())
     }
@@ -526,6 +566,155 @@ fn semantic_md_record(
     Ok(record)
 }
 
+/// Front-matter reader for the memory-file format: a `---` fenced block of `key: value` lines where
+/// two-space-indented lines nest under the preceding top-level key. Deliberately not a general YAML
+/// parser — the format is fixed and four fields do not justify a new dependency.
+fn parse_front_matter(raw: &str) -> Option<(Map<String, Value>, String)> {
+    let mut lines = raw.lines();
+    if lines.next()?.trim() != "---" {
+        return None;
+    }
+    let mut fields = Map::new();
+    let mut nested: Option<(String, Map<String, Value>)> = None;
+    let mut body = String::new();
+    let mut in_body = false;
+
+    for line in lines {
+        if in_body {
+            body.push_str(line);
+            body.push('\n');
+            continue;
+        }
+        if line.trim() == "---" {
+            if let Some((key, map)) = nested.take() {
+                fields.insert(key, Value::Object(map));
+            }
+            in_body = true;
+            continue;
+        }
+        let indented = line.starts_with("  ") || line.starts_with('\t');
+        let Some((key, value)) = line.trim().split_once(':') else {
+            continue;
+        };
+        let key = key.trim().to_string();
+        let value = unquote(value);
+        if indented {
+            if let Some((_, map)) = nested.as_mut() {
+                map.insert(key, Value::String(value));
+            }
+        } else {
+            if let Some((previous, map)) = nested.take() {
+                fields.insert(previous, Value::Object(map));
+            }
+            if value.is_empty() {
+                nested = Some((key, Map::new()));
+            } else {
+                fields.insert(key, Value::String(value));
+            }
+        }
+    }
+
+    in_body.then(|| (fields, body.trim().to_string()))
+}
+
+fn unquote(value: &str) -> String {
+    let trimmed = value.trim();
+    match trimmed.strip_prefix('"').and_then(|v| v.strip_suffix('"')) {
+        Some(inner) => inner.replace("\\\"", "\"").replace("\\\\", "\\"),
+        None => trimmed.to_string(),
+    }
+}
+
+/// Pull `[[slug]]` references out of a body. These are the hand-authored edges between memories.
+fn wiki_links(body: &str) -> Vec<String> {
+    let mut links: Vec<String> = Vec::new();
+    let mut rest = body;
+    while let Some(start) = rest.find("[[") {
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("]]") else { break };
+        let link = after[..end].trim();
+        if !link.is_empty() && !links.iter().any(|existing| existing == link) {
+            links.push(link.to_string());
+        }
+        rest = &after[end + 2..];
+    }
+    links
+}
+
+fn memory_md_record(path: &Path, raw: &str, domain: &str) -> Result<MemoryRecord> {
+    let (fields, body) =
+        parse_front_matter(raw).context("memory file has no `---` front-matter block")?;
+    if body.is_empty() {
+        anyhow::bail!("memory file has front matter but an empty body");
+    }
+
+    let stem = path.file_stem().and_then(|stem| stem.to_str()).unwrap_or_default();
+    let name = fields
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(stem)
+        .to_string();
+    let description = fields
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let metadata = fields.get("metadata").and_then(Value::as_object);
+
+    // `domain` is a physics parameter, not a label: dream-time repulsion is 35% stronger across
+    // domains (physics.rs:97). Keying it on the memory type makes user/feedback/project/reference
+    // settle into separate basins instead of smearing together.
+    let resolved_domain = metadata
+        .and_then(|metadata| metadata.get("type"))
+        .and_then(Value::as_str)
+        .filter(|kind| !kind.is_empty())
+        .unwrap_or(domain)
+        .to_string();
+
+    // The slug gives BM25 real terms and the description is a hand-written summary, so both belong
+    // in the embedded text rather than sitting in metadata where retrieval cannot see them.
+    let text = if description.is_empty() {
+        format!("{name}\n\n{body}")
+    } else {
+        format!("{name}: {description}\n\n{body}")
+    };
+
+    // source_key is the slug, so re-importing an edited memory updates in place instead of forking.
+    let mut record = MemoryRecord::new("claude-memory", name.clone(), text);
+    record.domain = resolved_domain;
+    record.source_file = Some(path.display().to_string());
+    record.source_record_id = Some(name.clone());
+    record.speaker = Some("assistant".into());
+    record.timestamp = metadata
+        .and_then(|metadata| metadata.get("modified"))
+        .and_then(Value::as_str)
+        .and_then(|stamp| DateTime::parse_from_rfc3339(stamp).ok())
+        .map(|stamp| stamp.with_timezone(&Utc));
+
+    record.metadata.insert("memory_name".into(), Value::String(name));
+    if !description.is_empty() {
+        record
+            .metadata
+            .insert("description".into(), Value::String(description));
+    }
+    if let Some(metadata) = metadata {
+        for key in ["type", "node_type", "originSessionId"] {
+            if let Some(value) = metadata.get(key) {
+                record.metadata.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+    let links = wiki_links(&body);
+    if !links.is_empty() {
+        record.metadata.insert(
+            "links".into(),
+            Value::Array(links.into_iter().map(Value::String).collect()),
+        );
+    }
+    Ok(record)
+}
+
 fn resolve_kind(kind: SourceKind, path: &Path) -> SourceKind {
     if !matches!(kind, SourceKind::Auto) {
         return kind;
@@ -811,5 +1000,85 @@ mod tests {
             })
             .unwrap();
         assert_eq!(records[0].text, "Asked Gemini about splats");
+    }
+
+    /// Uses the real on-disk shape: escaped quotes inside the description, a trailing space after
+    /// `metadata:`, and an em dash — all three appear in the actual memory files.
+    fn memory_fixture() -> &'static str {
+        "---\nname: feedback-no-blades\ndescription: \"The \\\"blade on the end\\\" pattern \
+         hurts — say the warm thing plainly\"\nmetadata: \n  node_type: memory\n  type: feedback\
+         \n  originSessionId: 549c56fb\n  modified: 2026-07-21T21:06:31.468Z\n---\n\nSay the warm \
+         thing and let it end where it ends.\n\nRelated: [[user-jason-working-style]], \
+         [[project-narrator-era-rest]], [[user-jason-working-style]]\n"
+    }
+
+    #[test]
+    fn memory_md_maps_type_to_domain_and_keeps_links() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("feedback_no_blades.md");
+        fs::write(&path, memory_fixture()).unwrap();
+        let mut records = Vec::new();
+        Ingestor::new(temp.path().join("errors.jsonl"))
+            .ingest_path(SourceKind::MemoryMd, &path, "chat", |record| {
+                records.push(record);
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(records.len(), 1, "one memory file is one record");
+        let record = &records[0];
+        // `type` wins over the CLI-supplied domain because domain drives dream repulsion.
+        assert_eq!(record.domain, "feedback");
+        assert_eq!(record.source_key, "feedback-no-blades");
+        assert!(record.text.contains("blade on the end\" pattern"), "escaped quotes survive");
+        assert!(record.text.contains("let it end where it ends"), "body is embedded");
+        assert_eq!(
+            record.timestamp.map(|ts| ts.to_rfc3339()),
+            Some("2026-07-21T21:06:31.468+00:00".into())
+        );
+        let links = record.metadata.get("links").unwrap().as_array().unwrap();
+        assert_eq!(links.len(), 2, "duplicate wiki-links collapse");
+    }
+
+    #[test]
+    fn memory_md_is_idempotent_and_skips_the_index() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("feedback_no_blades.md"), memory_fixture()).unwrap();
+        fs::write(temp.path().join("MEMORY.md"), "- [No blades](feedback_no_blades.md) — hook\n")
+            .unwrap();
+
+        let ingest = |records: &mut Vec<MemoryRecord>| {
+            Ingestor::new(temp.path().join("errors.jsonl"))
+                .ingest_path(SourceKind::MemoryMd, temp.path(), "chat", |record| {
+                    records.push(record);
+                    Ok(())
+                })
+                .unwrap()
+        };
+        let mut first = Vec::new();
+        let report = ingest(&mut first);
+        let mut second = Vec::new();
+        ingest(&mut second);
+
+        // MEMORY.md is an index of pointers; ingesting it would weakly match every query.
+        assert_eq!(first.len(), 1, "the index file is skipped");
+        assert_eq!(report.rejected, 0);
+        assert_eq!(first[0].id, second[0].id, "re-import updates in place");
+    }
+
+    #[test]
+    fn memory_md_without_front_matter_is_quarantined_not_dropped() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("plain.md");
+        fs::write(&path, "just a note, no front matter\n").unwrap();
+        let mut records = Vec::new();
+        let report = Ingestor::new(temp.path().join("errors.jsonl"))
+            .ingest_path(SourceKind::MemoryMd, &path, "chat", |record| {
+                records.push(record);
+                Ok(())
+            })
+            .unwrap();
+        assert!(records.is_empty());
+        assert_eq!(report.rejected, 1);
     }
 }

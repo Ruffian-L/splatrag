@@ -113,11 +113,13 @@ pub fn discover_basins(
                     .map(|basin| basin.path.clone())
                     .unwrap_or_else(|| "memory/unlabeled".into()),
                 summary: old.map(|basin| basin.summary.clone()).unwrap_or_default(),
-                label_state: if reused.is_some() {
-                    "stable".into()
-                } else {
-                    "pending".into()
-                },
+                // A reused basin keeps whatever state it had. Promoting to `stable` on reuse alone
+                // marked basins stable that were never successfully labeled — labeling only visits
+                // `pending` basins, so a placeholder `unlabeled-<id>` name became permanent after
+                // one dream cycle, and any labeling failure was unrecoverable.
+                label_state: old
+                    .map(|basin| basin.label_state.clone())
+                    .unwrap_or_else(|| "pending".into()),
                 stability,
                 centroid,
                 member_ids: ids,
