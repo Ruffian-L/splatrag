@@ -1,3 +1,5 @@
+pub mod extract;
+
 use crate::record::{AttachmentRef, MemoryRecord};
 use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
@@ -5,6 +7,7 @@ use clap::ValueEnum;
 use serde::de::{DeserializeSeed, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
+use std::collections::HashMap;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
@@ -16,6 +19,10 @@ pub enum SourceKind {
     Auto,
     Claude,
     Grok,
+    /// A whole Grok account export directory: `prod-grok-backend.json` plus the
+    /// `prod-mc-asset-server/<uuid>/content` blobs it references. Distinct from `Grok`, which reads
+    /// a bare conversations array and cannot resolve attachments.
+    GrokExport,
     Gemini,
     AgentJsonl,
     SemanticMd,
@@ -23,12 +30,20 @@ pub enum SourceKind {
     Jsonl,
 }
 
+/// Filenames fixed by the export format itself.
+const BACKEND_JSON: &str = "prod-grok-backend.json";
+const ASSET_DIR: &str = "prod-mc-asset-server";
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct IngestReport {
     pub files: usize,
     pub source_items: usize,
     pub emitted: usize,
     pub rejected: usize,
+    /// Assets recognised but still awaiting a model to read them (images) or an unpacker
+    /// (pdf/zip). Distinct from `rejected`: nothing is wrong with them yet.
+    #[serde(default)]
+    pub pending: usize,
 }
 
 pub struct Ingestor {
@@ -68,6 +83,13 @@ impl Ingestor {
     where
         F: FnMut(MemoryRecord) -> Result<()>,
     {
+        // An export is one unit, not a tree to walk: the backend JSON is the join table for the
+        // asset blobs beside it, so descending into them separately would lose the linkage.
+        // Auto-detection keys on the export's own fixed filename, never on a user-chosen one.
+        if matches!(kind, SourceKind::GrokExport) || is_grok_export(kind, path) {
+            return self.ingest_grok_export(path, domain, report, emit);
+        }
+
         if path.is_dir() {
             let mut children: Vec<_> = fs::read_dir(path)?
                 .filter_map(|entry| entry.ok().map(|entry| entry.path()))
@@ -105,7 +127,152 @@ impl Ingestor {
             SourceKind::SemanticMd => self.ingest_semantic_md(path, domain, report, emit),
             SourceKind::MemoryMd => self.ingest_memory_md(path, domain, report, emit),
             SourceKind::Auto => unreachable!("auto source kind must be resolved"),
+            SourceKind::GrokExport => unreachable!("grok exports are handled before the walk"),
         }
+    }
+
+    /// Read a Grok account export as one unit.
+    ///
+    /// Two record streams come out, and they are keyed differently on purpose:
+    ///
+    /// * **Responses** key on `response._id`, which is already a UUID and globally unique. No path
+    ///   and no conversation prefix — moving or re-downloading the export must not fork the record.
+    /// * **Assets** key on their asset UUID, taken from the directory name under
+    ///   `prod-mc-asset-server/`. The flattened `unnested_files/` copies of these blobs carry
+    ///   invented filenames that collide, so a name can never be the key.
+    ///
+    /// Only ~15% of assets are referenced by any response (238 of 1568 in the export this was
+    /// written against). The rest are emitted anyway, parentless, and left to settle by meaning
+    /// alone — dropping them would discard the bulk of the archive.
+    fn ingest_grok_export<F>(
+        &self,
+        path: &Path,
+        domain: &str,
+        report: &mut IngestReport,
+        emit: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(MemoryRecord) -> Result<()>,
+    {
+        let (root, backend) = if path.is_dir() {
+            (path.to_path_buf(), path.join(BACKEND_JSON))
+        } else {
+            let root = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+            (root, path.to_path_buf())
+        };
+        let assets_dir = root.join(ASSET_DIR);
+
+        report.files += 1;
+        let raw = fs::read_to_string(&backend)
+            .with_context(|| format!("failed to read {}", backend.display()))?;
+        let export: Value = serde_json::from_str(&raw)
+            .with_context(|| format!("failed to parse {}", backend.display()))?;
+
+        let conversations = export
+            .get("conversations")
+            .and_then(Value::as_array)
+            .context("export has no conversations array")?;
+
+        let mut attached: HashMap<String, AssetOrigin> = HashMap::new();
+        for entry in conversations {
+            report.source_items += 1;
+            match grok_export_conversation(entry, &assets_dir, domain, &mut attached) {
+                Ok(records) => {
+                    for record in records {
+                        emit(record)?;
+                        report.emitted += 1;
+                    }
+                }
+                Err(error) => {
+                    report.rejected += 1;
+                    self.quarantine(&backend, report.source_items, &error.to_string())?;
+                }
+            }
+        }
+
+        self.ingest_assets(&assets_dir, domain, &attached, report, emit)
+    }
+
+    /// Emit one record per asset that carries extractable text.
+    ///
+    /// Images, PDFs and archives yield no text here — they are recorded as pending rather than
+    /// emitted, because a memory whose text is empty matches every query weakly and pollutes the
+    /// field. They become records once the OCR/unpack pass fills them in.
+    fn ingest_assets<F>(
+        &self,
+        assets_dir: &Path,
+        domain: &str,
+        attached: &HashMap<String, AssetOrigin>,
+        report: &mut IngestReport,
+        emit: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(MemoryRecord) -> Result<()>,
+    {
+        if !assets_dir.is_dir() {
+            return Ok(());
+        }
+        let mut entries: Vec<_> = fs::read_dir(assets_dir)?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .collect();
+        entries.sort();
+
+        for entry in entries {
+            let Some(asset_id) = entry.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let Some(blob) = asset_blob(&entry) else {
+                continue;
+            };
+            report.files += 1;
+            report.source_items += 1;
+
+            let extracted = match extract::extract(asset_id, &blob) {
+                Ok(extracted) => extracted,
+                Err(error) => {
+                    report.rejected += 1;
+                    self.quarantine(&blob, report.source_items, &error.to_string())?;
+                    continue;
+                }
+            };
+            let Some(text) = extracted.text.as_ref().filter(|text| !text.trim().is_empty()) else {
+                report.pending += 1;
+                continue;
+            };
+
+            let mut record = MemoryRecord::new("grok-asset", asset_id, text.clone());
+            record.domain = domain.into();
+            record.source_file = Some(blob.display().to_string());
+            record.source_record_id = Some(asset_id.to_string());
+            record.metadata.insert(
+                "media_type".into(),
+                Value::String(extracted.media_type.clone()),
+            );
+            record
+                .metadata
+                .insert("content_sha256".into(), Value::String(extracted.sha256));
+            // A referenced asset inherits its response's place in the archive, so the turns that
+            // explain the picture stay reachable from the picture.
+            match attached.get(asset_id) {
+                Some(origin) => {
+                    record.conversation_id = Some(origin.conversation_id.clone());
+                    record.parent_id = Some(origin.response_id.clone());
+                    record.timestamp = origin.timestamp;
+                    record.metadata.insert("orphan".into(), Value::Bool(false));
+                    if let Some(title) = &origin.title {
+                        record
+                            .metadata
+                            .insert("conversation_title".into(), Value::String(title.clone()));
+                    }
+                }
+                None => {
+                    record.metadata.insert("orphan".into(), Value::Bool(true));
+                }
+            }
+            emit(record)?;
+            report.emitted += 1;
+        }
+        Ok(())
     }
 
     fn ingest_json_array<F, G>(
@@ -463,6 +630,149 @@ fn grok_records(path: &Path, value: Value, domain: &str) -> Result<Vec<MemoryRec
     Ok(records)
 }
 
+/// Where a referenced asset came from, so the blob can inherit its response's context.
+///
+/// Without this an attached asset lands with no `conversation_id`, which silently disables
+/// [`crate::cold_store::ColdStore::context`] for it — the neighbouring turns that explain what the
+/// picture *is* would be unreachable from the picture.
+#[derive(Debug, Clone)]
+struct AssetOrigin {
+    conversation_id: String,
+    response_id: String,
+    timestamp: Option<DateTime<Utc>>,
+    title: Option<String>,
+}
+
+/// Trim a field and treat blank as absent.
+///
+/// Grok writes `"model": ""` on 61 of 1061 responses. Left alone that empty string is a *value*,
+/// so a `models` recall filter would have to know to ask for `""` to find them.
+fn clean(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Speakers additionally case-fold: the same export writes both `assistant` and `ASSISTANT`, and
+/// two spellings of one role would split every grouping and filter that touches it.
+fn clean_speaker(value: Option<String>) -> Option<String> {
+    clean(value).map(|value| value.to_lowercase())
+}
+
+/// Locate the payload for one asset directory. The export stores each blob as
+/// `<asset-uuid>/content`; a few entries are plain files (profile pictures) instead of directories.
+fn asset_blob(entry: &Path) -> Option<PathBuf> {
+    if entry.is_dir() {
+        let content = entry.join("content");
+        return content.is_file().then_some(content);
+    }
+    entry.is_file().then(|| entry.to_path_buf())
+}
+
+/// Turn one `{conversation, responses}` pair into records, recording which assets it claimed.
+fn grok_export_conversation(
+    entry: &Value,
+    assets_dir: &Path,
+    domain: &str,
+    attached: &mut HashMap<String, AssetOrigin>,
+) -> Result<Vec<MemoryRecord>> {
+    let conversation = entry
+        .get("conversation")
+        .context("export entry has no conversation object")?;
+    let conversation_id =
+        string_at(conversation, &["id"]).context("conversation has no id")?;
+    let title = string_at(conversation, &["title"]).filter(|title| !title.trim().is_empty());
+    let responses = entry
+        .get("responses")
+        .and_then(Value::as_array)
+        .context("conversation has no responses array")?;
+
+    let mut records = Vec::with_capacity(responses.len());
+    for (index, wrapper) in responses.iter().enumerate() {
+        let response = wrapper.get("response").unwrap_or(wrapper);
+        let Some(text) = response.get("message").and_then(text_from_value) else {
+            continue;
+        };
+        if text.trim().is_empty() {
+            continue;
+        }
+        // `_id` is a UUID and unique across the whole export, so it stands alone as the key.
+        let response_id = string_at(response, &["_id"])
+            .or_else(|| string_at(response, &["id"]))
+            .unwrap_or_else(|| format!("{conversation_id}/{index}"));
+
+        let timestamp = timestamp_at(response);
+        let mut record = MemoryRecord::new("grok-export", response_id.clone(), text);
+        record.domain = domain.into();
+        record.source_record_id = Some(response_id.clone());
+        record.conversation_id = Some(conversation_id.clone());
+        record.turn_index = Some(index as u64);
+        record.speaker = clean_speaker(string_at(response, &["sender"]));
+        record.model = clean(string_at(response, &["model"]));
+        record.parent_id = clean(string_at(response, &["parent_response_id"]));
+        record.timestamp = timestamp;
+        record.attachments = export_attachments(
+            response,
+            assets_dir,
+            attached,
+            &AssetOrigin {
+                conversation_id: conversation_id.clone(),
+                response_id,
+                timestamp,
+                title: title.clone(),
+            },
+        );
+        if let Some(title) = &title {
+            record
+                .metadata
+                .insert("conversation_title".into(), Value::String(title.clone()));
+        }
+        records.push(record);
+    }
+    Ok(records)
+}
+
+/// Resolve `file_attachments: ["<asset-uuid>", ...]` against the asset directory.
+///
+/// The UUID is retained even when the blob is missing from disk (2 of 240 were, in the export this
+/// was written against) so the dangling reference stays visible instead of being silently dropped.
+fn export_attachments(
+    response: &Value,
+    assets_dir: &Path,
+    attached: &mut HashMap<String, AssetOrigin>,
+    origin: &AssetOrigin,
+) -> Vec<AttachmentRef> {
+    let Some(ids) = response.get("file_attachments").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    ids.iter()
+        .filter_map(Value::as_str)
+        .map(|asset_id| {
+            // First reference wins: an asset quoted again later belongs to where it first appeared.
+            attached
+                .entry(asset_id.to_string())
+                .or_insert_with(|| origin.clone());
+            let blob = asset_blob(&assets_dir.join(asset_id));
+            let media_type = blob
+                .as_ref()
+                .and_then(|path| fs::read(path).ok())
+                .map(|bytes| extract::sniff(&bytes).media_type().to_string());
+            let mut metadata = Map::new();
+            metadata.insert("asset_id".into(), Value::String(asset_id.to_string()));
+            if blob.is_none() {
+                metadata.insert("missing".into(), Value::Bool(true));
+            }
+            AttachmentRef {
+                path: blob.map(|path| path.display().to_string()),
+                name: Some(asset_id.to_string()),
+                media_type,
+                sha256: None,
+                metadata,
+            }
+        })
+        .collect()
+}
+
 fn jsonl_record(
     kind: SourceKind,
     path: &Path,
@@ -715,6 +1025,19 @@ fn memory_md_record(path: &Path, raw: &str, domain: &str) -> Result<MemoryRecord
     Ok(record)
 }
 
+/// Under `Auto`, recognise an export by the one filename the export format fixes.
+fn is_grok_export(kind: SourceKind, path: &Path) -> bool {
+    if !matches!(kind, SourceKind::Auto) {
+        return false;
+    }
+    if path.is_dir() {
+        return path.join(BACKEND_JSON).is_file();
+    }
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == BACKEND_JSON)
+}
+
 fn resolve_kind(kind: SourceKind, path: &Path) -> SourceKind {
     if !matches!(kind, SourceKind::Auto) {
         return kind;
@@ -793,19 +1116,54 @@ fn timestamp_at(value: &Value) -> Option<DateTime<Utc>> {
                 }
             }
             Value::Number(number) => {
-                if let Some(mut value) = number.as_i64() {
-                    if value > 10_000_000_000 {
-                        value /= 1000;
-                    }
-                    if let Some(timestamp) = Utc.timestamp_opt(value, 0).single() {
-                        return Some(timestamp);
-                    }
+                if let Some(value) = number.as_i64()
+                    && let Some(timestamp) = epoch_to_utc(value)
+                {
+                    return Some(timestamp);
+                }
+            }
+            // Mongo extended JSON: `{"$date": {"$numberLong": "1785272919201"}}`, and the shorter
+            // `{"$date": "2026-07-28T21:07:53Z"}`. Every Grok export response timestamp is the first
+            // shape, so without this arm the whole conversation history imports undated.
+            Value::Object(_) => {
+                if let Some(timestamp) = mongo_timestamp(raw) {
+                    return Some(timestamp);
                 }
             }
             _ => {}
         }
     }
     None
+}
+
+/// Seconds or milliseconds since the epoch, disambiguated by magnitude. The cutoff is year 2286 in
+/// seconds, which no export here predates or exceeds, so anything larger is milliseconds.
+fn epoch_to_utc(value: i64) -> Option<DateTime<Utc>> {
+    if value.abs() > 10_000_000_000 {
+        Utc.timestamp_millis_opt(value).single()
+    } else {
+        Utc.timestamp_opt(value, 0).single()
+    }
+}
+
+fn mongo_timestamp(value: &Value) -> Option<DateTime<Utc>> {
+    let inner = value.get("$date")?;
+    match inner {
+        Value::String(text) => parse_timestamp(text),
+        Value::Number(number) => epoch_to_utc(number.as_i64()?),
+        // `$numberLong` is a *string* in canonical extended JSON, because the value can exceed
+        // what a JSON number is guaranteed to hold.
+        Value::Object(_) => {
+            let raw = inner.get("$numberLong")?;
+            let millis = match raw {
+                Value::String(text) => text.parse::<i64>().ok()?,
+                Value::Number(number) => number.as_i64()?,
+                _ => return None,
+            };
+            epoch_to_utc(millis)
+        }
+        _ => None,
+    }
 }
 
 fn parse_timestamp(text: &str) -> Option<DateTime<Utc>> {
@@ -1064,6 +1422,169 @@ mod tests {
         assert_eq!(first.len(), 1, "the index file is skipped");
         assert_eq!(report.rejected, 0);
         assert_eq!(first[0].id, second[0].id, "re-import updates in place");
+    }
+
+    /// Every response timestamp in a Grok export is Mongo extended JSON. Before this parsed, all
+    /// 1061 responses imported with `timestamp: None` and no error to show for it.
+    #[test]
+    fn mongo_extended_json_dates_parse() {
+        let millis = serde_json::json!({"create_time": {"$date": {"$numberLong": "1785272919201"}}});
+        assert_eq!(
+            timestamp_at(&millis).map(|ts| ts.to_rfc3339()),
+            Some("2026-07-28T21:08:39.201+00:00".into())
+        );
+        // The short form, and a plain RFC3339 string, must still work.
+        let short = serde_json::json!({"create_time": {"$date": "2026-07-28T21:07:53Z"}});
+        assert!(timestamp_at(&short).is_some());
+        let plain = serde_json::json!({"create_time": "2026-07-28T21:07:53.018584Z"});
+        assert!(timestamp_at(&plain).is_some());
+        // Seconds vs milliseconds are told apart by magnitude, not by field name.
+        let seconds = serde_json::json!({"timestamp": 1785272919});
+        assert_eq!(
+            timestamp_at(&seconds).map(|ts| ts.to_rfc3339()),
+            Some("2026-07-28T21:08:39+00:00".into())
+        );
+    }
+
+    /// Builds the export layout on disk: backend JSON plus `<asset-uuid>/content` blobs.
+    fn export_fixture(root: &Path) {
+        let assets = root.join(ASSET_DIR);
+        for (id, body) in [
+            ("asset-attached", &b"a note that was attached"[..]),
+            ("asset-orphan", &b"a note nothing points at"[..]),
+        ] {
+            fs::create_dir_all(assets.join(id)).unwrap();
+            fs::write(assets.join(id).join("content"), body).unwrap();
+        }
+        fs::create_dir_all(assets.join("asset-image")).unwrap();
+        fs::write(
+            assets.join("asset-image").join("content"),
+            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR",
+        )
+        .unwrap();
+
+        fs::write(
+            root.join(BACKEND_JSON),
+            r#"{"conversations":[{
+                "conversation":{"id":"conv-1","title":"Physics of Friendship"},
+                "responses":[
+                  {"response":{"_id":"resp-1","sender":"human","model":"grok-4",
+                    "message":"what did we decide",
+                    "create_time":{"$date":{"$numberLong":"1785272919201"}},
+                    "file_attachments":["asset-attached","asset-gone"]}},
+                  {"response":{"_id":"resp-2","sender":"ASSISTANT","model":"",
+                    "message":"we decided to keep the cold log","parent_response_id":"resp-1"}}
+                ]}]}"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn grok_export_keys_on_uuids_and_resolves_assets() {
+        let temp = tempfile::tempdir().unwrap();
+        export_fixture(temp.path());
+        let mut records = Vec::new();
+        let report = Ingestor::new(temp.path().join("errors.jsonl"))
+            .ingest_path(SourceKind::GrokExport, temp.path(), "chat", |record| {
+                records.push(record);
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(report.rejected, 0);
+        // Two responses + two text assets; the PNG waits for OCR instead of becoming empty text.
+        assert_eq!(report.emitted, 4);
+        assert_eq!(report.pending, 1);
+
+        let first = records.iter().find(|r| r.source == "grok-export").unwrap();
+        // The key is the bare response UUID: no path, so moving the export cannot fork the record.
+        assert_eq!(first.source_key, "resp-1");
+        assert_eq!(first.conversation_id.as_deref(), Some("conv-1"));
+        assert_eq!(first.model.as_deref(), Some("grok-4"));
+        assert!(first.timestamp.is_some(), "mongo dates must survive ingest");
+        assert_eq!(
+            first.metadata.get("conversation_title").and_then(Value::as_str),
+            Some("Physics of Friendship")
+        );
+
+        // A referenced-but-missing blob stays visible as a dangling ref rather than vanishing.
+        assert_eq!(first.attachments.len(), 2);
+        let missing = first
+            .attachments
+            .iter()
+            .find(|a| a.name.as_deref() == Some("asset-gone"))
+            .unwrap();
+        assert!(missing.path.is_none());
+        assert_eq!(missing.metadata.get("missing"), Some(&Value::Bool(true)));
+
+        let resolved = first
+            .attachments
+            .iter()
+            .find(|a| a.name.as_deref() == Some("asset-attached"))
+            .unwrap();
+        assert_eq!(resolved.media_type.as_deref(), Some("text/plain"));
+
+        // Orphans carry no conversation but are kept — they are the bulk of a real export.
+        let orphan = records
+            .iter()
+            .find(|r| r.source_key == "asset-orphan")
+            .unwrap();
+        assert_eq!(orphan.source, "grok-asset");
+        assert_eq!(orphan.metadata.get("orphan"), Some(&Value::Bool(true)));
+        assert!(orphan.conversation_id.is_none());
+        // A referenced asset inherits its response's context, so ColdStore::context can still find
+        // the turns that explain what the blob is.
+        let attached = records
+            .iter()
+            .find(|r| r.source_key == "asset-attached")
+            .unwrap();
+        assert_eq!(attached.metadata.get("orphan"), Some(&Value::Bool(false)));
+        assert_eq!(attached.conversation_id.as_deref(), Some("conv-1"));
+        assert_eq!(attached.parent_id.as_deref(), Some("resp-1"));
+        assert_eq!(attached.timestamp, first.timestamp);
+    }
+
+    /// The export writes both `assistant` and `ASSISTANT`, and `"model": ""` on a fifth of
+    /// responses. Two spellings of one role split every grouping; an empty string is a value a
+    /// filter would have to ask for by name.
+    #[test]
+    fn grok_export_normalizes_speaker_case_and_blank_fields() {
+        let temp = tempfile::tempdir().unwrap();
+        export_fixture(temp.path());
+        let mut records = Vec::new();
+        Ingestor::new(temp.path().join("errors.jsonl"))
+            .ingest_path(SourceKind::GrokExport, temp.path(), "chat", |record| {
+                records.push(record);
+                Ok(())
+            })
+            .unwrap();
+
+        let second = records.iter().find(|r| r.source_key == "resp-2").unwrap();
+        assert_eq!(second.speaker.as_deref(), Some("assistant"));
+        assert_eq!(second.model, None, "blank model is absent, not empty");
+    }
+
+    #[test]
+    fn grok_export_is_idempotent_and_autodetected() {
+        let temp = tempfile::tempdir().unwrap();
+        export_fixture(temp.path());
+        let ingest = |kind| {
+            let mut records = Vec::new();
+            Ingestor::new(temp.path().join("errors.jsonl"))
+                .ingest_path(kind, temp.path(), "chat", |record| {
+                    records.push(record);
+                    Ok(())
+                })
+                .unwrap();
+            records
+        };
+        // Auto must recognise the export by its fixed filename, not by anything user-chosen.
+        let explicit = ingest(SourceKind::GrokExport);
+        let auto = ingest(SourceKind::Auto);
+        assert_eq!(explicit.len(), auto.len());
+        let ids: Vec<_> = explicit.iter().map(|r| r.id).collect();
+        let again: Vec<_> = auto.iter().map(|r| r.id).collect();
+        assert_eq!(ids, again, "re-import must update in place, not fork");
     }
 
     #[test]

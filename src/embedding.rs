@@ -52,13 +52,14 @@ impl EmbeddingClient {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
+        let bounded: Vec<String> = texts.iter().map(|text| bound_for_embedding(text)).collect();
         let url = format!("{}/v1/embeddings", self.config.url.trim_end_matches('/'));
         let response = self
             .client
             .post(url)
             .json(&EmbeddingRequest {
                 model: &self.config.model,
-                input: texts,
+                input: &bounded,
                 encoding_format: "float",
             })
             .send()
@@ -166,6 +167,74 @@ impl LabelingClient {
     }
 }
 
+/// What the vision model is asked of every picture in the archive.
+///
+/// Transcription first, description only as a fallback: most of these images are screenshots of
+/// terminals, code and chat, where the literal text *is* the memory. Asking for a description of a
+/// screenshot instead would throw away the thing worth keeping.
+const OCR_PROMPT: &str = "Transcribe all text visible in this image verbatim, preserving line \
+breaks and structure. If the image contains no readable text, instead describe what it shows in \
+one or two sentences. Output only the transcription or description, with no preamble.";
+
+impl LabelingClient {
+    /// Read an image with the local vision model.
+    ///
+    /// Requires `llama-server` to have been started with a matching `--mmproj` projector; without
+    /// one the server accepts the request and simply never sees the image.
+    pub async fn read_image(&self, bytes: &[u8], media_type: &str) -> Result<String> {
+        if !self.config.enabled {
+            anyhow::bail!("labeling/vision model is disabled");
+        }
+        let url = format!(
+            "{}/v1/chat/completions",
+            self.config.url.trim_end_matches('/')
+        );
+        let data_url = format!(
+            "data:{media_type};base64,{}",
+            crate::ingest::extract::base64_encode(bytes)
+        );
+        let request = serde_json::json!({
+            "model": self.config.model,
+            "temperature": 0.0,
+            // Long enough for a dense screenshot; the cost of truncation is a clipped memory.
+            "max_tokens": 900,
+            // Same reason as label_request: Gemma 4 thinks by default in llama.cpp and will spend
+            // the entire budget on hidden reasoning, returning an empty `content`.
+            "chat_template_kwargs": {"enable_thinking": false},
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": OCR_PROMPT},
+                {"type": "image_url", "image_url": {"url": data_url}}
+            ]}]
+        });
+
+        let response = self
+            .client
+            .post(url)
+            .json(&request)
+            .send()
+            .await
+            .context("failed to reach local vision server")?
+            .error_for_status()
+            .context("local vision server rejected request")?
+            .json::<Value>()
+            .await
+            .context("invalid local vision response")?;
+
+        let content = response
+            .pointer("/choices/0/message/content")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if content.is_empty() {
+            anyhow::bail!(
+                "vision model returned empty content (is --mmproj loaded, and thinking disabled?)"
+            );
+        }
+        Ok(content)
+    }
+}
+
 fn label_request(model: &str, prompt: String) -> Value {
     serde_json::json!({
         "model": model,
@@ -207,6 +276,27 @@ fn parse_label_json(content: &str) -> Result<BasinLabelDraft> {
     Ok(draft)
 }
 
+/// Characters of a memory that actually reach the embedding server.
+///
+/// The archive contains pasted logs and code dumps; the largest single memory in it tokenizes to
+/// **43,771 tokens**, past the server's whole 40,960-token context. That request comes back as a
+/// 400 and takes the entire ingest run down with it, which is how the Grok import silently stopped
+/// at 896 of 1819 records.
+///
+/// Bounding the input is not data loss. The cold log is authoritative and keeps every byte; the
+/// embedding is derived state, and a mean-pooled vector over 40k tokens of log spew would not have
+/// carried meaning anyway. Roughly 4 chars per token, so this sits near 25k tokens — comfortably
+/// inside the context with room for whatever the server adds.
+const EMBED_CHAR_BUDGET: usize = 100_000;
+
+/// Clip to [`EMBED_CHAR_BUDGET`] on a char boundary. Cheap no-op for the overwhelming majority.
+fn bound_for_embedding(text: &str) -> String {
+    if text.len() <= EMBED_CHAR_BUDGET {
+        return text.to_string();
+    }
+    text.chars().take(EMBED_CHAR_BUDGET).collect()
+}
+
 pub fn normalize(vector: &mut [f32]) {
     let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
     if norm > 1e-9 {
@@ -232,6 +322,23 @@ fn truncate(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One oversized memory must not be able to take an ingest run down.
+    #[test]
+    fn oversized_text_is_bounded_but_ordinary_text_is_untouched() {
+        let ordinary = "a normal conversational turn about splat memory";
+        assert_eq!(bound_for_embedding(ordinary), ordinary);
+
+        // Larger than the real 43,771-token record that aborted the Grok import.
+        let huge = "x".repeat(EMBED_CHAR_BUDGET * 3);
+        let bounded = bound_for_embedding(&huge);
+        assert_eq!(bounded.chars().count(), EMBED_CHAR_BUDGET);
+
+        // Multi-byte input must clip on a char boundary, not mid-codepoint.
+        let wide = "日".repeat(EMBED_CHAR_BUDGET + 500);
+        let bounded = bound_for_embedding(&wide);
+        assert_eq!(bounded.chars().count(), EMBED_CHAR_BUDGET);
+    }
 
     #[test]
     fn matryoshka_vector_is_normalized() {

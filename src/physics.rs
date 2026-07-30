@@ -1,6 +1,7 @@
 use crate::ann::KeyedAnn;
 use crate::config::PhysicsConfig;
 use crate::geometry::{HotState, cosine};
+use crate::inversion::mass_from_radiance;
 use crate::topology::{PersistenceInterval, discover_basins};
 use anyhow::Result;
 use chrono::Utc;
@@ -58,7 +59,10 @@ pub fn dream(state: &mut HotState, ann: &KeyedAnn, config: &PhysicsConfig) -> Re
         .collect();
     for (splat, neighbors) in state.splats.iter_mut().zip(&semantic_neighbors) {
         splat.radiance = 1.0 + (neighbors.len() as f32 + 1.0).ln();
-        splat.mass = splat.radiance.max(0.1);
+        // Magnitude from connectivity; sign is an independent physics knob.
+        // Negative mass → repels. Negative gain is not consulted here (that inverts
+        // semantics at steer time, already baked into splat.semantics).
+        splat.mass = mass_from_radiance(splat.mass, splat.radiance);
     }
 
     let mut energy = f32::INFINITY;
@@ -95,10 +99,16 @@ pub fn dream(state: &mut HotState, ann: &KeyedAnn, config: &PhysicsConfig) -> Re
                     // as a multiplier on repulsion, so a foreign domain can flip an otherwise
                     // attracting pair into a repelling one. That is what lets a junk domain be
                     // quarantined into its own basin instead of merely sitting loosely nearby.
+                    //
+                    // Negative mass is a separate bollard: it forces repulsion regardless of
+                    // cosine. Negative gain does not live here — it already inverted semantics.
                     let mut weight = cosine(&splat.semantics, &other.semantics)
                         - config.semantic_threshold;
                     if splat.domain != other.domain {
                         weight -= config.cross_domain_repulsion;
+                    }
+                    if splat.mass < 0.0 || other.mass < 0.0 {
+                        weight = weight.min(-0.05);
                     }
 
                     if weight > 0.0 {
@@ -127,10 +137,12 @@ pub fn dream(state: &mut HotState, ann: &KeyedAnn, config: &PhysicsConfig) -> Re
         energy = 0.0;
         let mut displacement = 0.0;
         for (splat, force) in state.splats.iter_mut().zip(forces) {
+            // Inertial mass is |m|; sign already lived in the force (bollard rule above).
+            let inertia = splat.mass.abs().max(0.1);
             let acceleration = [
-                force[0] / splat.mass.max(0.1),
-                force[1] / splat.mass.max(0.1),
-                force[2] / splat.mass.max(0.1),
+                force[0] / inertia,
+                force[1] / inertia,
+                force[2] / inertia,
             ];
             for (axis, acceleration) in acceleration.iter().enumerate() {
                 splat.velocity[axis] =
@@ -139,7 +151,7 @@ pub fn dream(state: &mut HotState, ann: &KeyedAnn, config: &PhysicsConfig) -> Re
                 splat.position[axis] += delta;
                 displacement += delta.abs();
             }
-            energy += 0.5 * splat.mass * length(splat.velocity).powi(2);
+            energy += 0.5 * inertia * length(splat.velocity).powi(2);
         }
         steps_taken += 1;
         // Settle on total movement rather than a fixed step count: a field still collapsing keeps

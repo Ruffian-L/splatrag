@@ -8,6 +8,32 @@ No cloud model is used. Embeddings and basin labels come from local `llama-serve
 The local ANN is `fast-hnsw` with UUID strings as labels: insertion positions remain internal
 implementation details, while search ties and exported keys are sorted deterministically by UUID.
 
+## Where this came from
+
+*— Jason Van Pham*
+
+This originated from [SplatRagBench](https://github.com/Ruffian-L/SplatRagBench). When we first
+released SplatRAG the whole system wasn't polished yet, so we — me, Grok, Claude and Gemini —
+decided to release just the bench portion. That was special to me: the first project that married a
+lot of individual concepts.
+
+**Why splats?** Because to me a memory starts as an image. And as time goes on, or as my perception
+of it changes, the image changes too — and so does the history that builds around it. So when I
+watched a Gaussian splatting video on YouTube that had Google's Genie engine in it, I thought: how do
+we save pictures and info *into* splats?
+
+Other ideas we had: make a language out of RBFs. Use light and direction — actually, light was
+supposed to be how we steered originally. That was around the time NVIDIA came out with the ray
+tracing that could relight a whole room dynamically. The possibilities are endless, and so is scope.
+
+It was over-engineered in the beginning because I had hedged that AI memory only works if you save
+everything. Things can decay naturally. Context and memories can get minted (CRDT). Originally this
+code saved into actual splats, with dreamers for clustering basins and repelling noise — but not
+*removing* the noise, because we never know what treasures we forgot about.
+
+The longer account, in Jason's own words, is
+`ghost_team_story/human_story_to_team_story.md`. It is the source for this project's history.
+
 ## Services
 
 - Qdrant: `http://127.0.0.1:6360`, collection `export-conversations`, filtered by `scope_key`.

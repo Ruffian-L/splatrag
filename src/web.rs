@@ -1,9 +1,11 @@
+use crate::inversion::InversionOp;
+use crate::packet::{MemoryPacket, VqCodebook};
 use crate::record::{RecallFilters, RecallHit};
-use crate::service::{MemoryService, MemoryStatus};
+use crate::service::{MemoryService, MemoryStatus, SteerOpts, SteerReport};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -47,6 +49,52 @@ struct SearchQuery {
     limit: Option<usize>,
 }
 
+#[derive(Debug, Deserialize)]
+struct SteerBody {
+    memory_id: String,
+    /// Negative = invert semantics (OI). Positive = amplify. Zero = leave semantics.
+    #[serde(default)]
+    gain: f32,
+    /// polarity | householder | negative_gain
+    #[serde(default)]
+    op: Option<String>,
+    /// If set, overwrite mass. Negative mass repels. Not implied by gain.
+    mass: Option<f32>,
+    basin_id: Option<String>,
+    #[serde(default)]
+    lock: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct PacketQuery {
+    /// If true, attach VQ Unicode from default/codebook path.
+    #[serde(default)]
+    unicode: bool,
+    /// Optional path to niodv4 codebook_256.json
+    codebook: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UnpackBody {
+    #[serde(flatten)]
+    packet: MemoryPacket,
+    /// Override packet.memory_id when the wire form omits or remaps it.
+    #[serde(default)]
+    id_override: Option<String>,
+    #[serde(default)]
+    codebook: Option<String>,
+}
+
+fn open_codebook(path: Option<&str>, want: bool) -> Result<Option<VqCodebook>, ApiError> {
+    if !want && path.is_none() {
+        return Ok(None);
+    }
+    let path = path.unwrap_or(
+        "/media/ruffianl/backup_sandisk/02_projects/niodoo_team_build_code_backup_20260608-150015/worktree/niodv4/experiments/encode_decode/niodv4/results/codebook_256.json",
+    );
+    Ok(Some(VqCodebook::load_json(path)?))
+}
+
 #[derive(Debug, Serialize)]
 struct ViewerSplat {
     id: String,
@@ -79,6 +127,10 @@ pub async fn serve(service: Arc<MemoryService>) -> anyhow::Result<()> {
         .route("/api/splats", get(splats))
         .route("/api/memories/:id", get(memory))
         .route("/api/search", get(search))
+        // gain inverts/amplifies semantics; mass (if set negative) repels — independent knobs
+        .route("/api/steer", post(steer))
+        .route("/api/packet/:id", get(get_packet))
+        .route("/api/packet", post(post_packet))
         .layer(CorsLayer::permissive())
         .with_state(service);
     let listener = tokio::net::TcpListener::bind(&bind).await?;
@@ -200,4 +252,51 @@ async fn search(
             )
             .await?,
     ))
+}
+
+async fn steer(
+    State(service): State<Arc<MemoryService>>,
+    Json(body): Json<SteerBody>,
+) -> Result<Json<SteerReport>, ApiError> {
+    let id = Uuid::parse_str(&body.memory_id)?;
+    let op = match body.op.as_deref() {
+        None | Some("") => InversionOp::Polarity,
+        Some(name) => InversionOp::parse(name)?,
+    };
+    let opts = SteerOpts {
+        gain: body.gain,
+        op,
+        mass: body.mass,
+        basin_id: body.basin_id,
+        basin_locked: body.lock,
+    };
+    Ok(Json(service.steer(id, opts).await?))
+}
+
+async fn get_packet(
+    State(service): State<Arc<MemoryService>>,
+    Path(id): Path<String>,
+    Query(query): Query<PacketQuery>,
+) -> Result<Json<MemoryPacket>, ApiError> {
+    let id = Uuid::parse_str(&id)?;
+    let cb = open_codebook(query.codebook.as_deref(), query.unicode)?;
+    Ok(Json(service.pack_packet(id, cb.as_ref())?))
+}
+
+async fn post_packet(
+    State(service): State<Arc<MemoryService>>,
+    Json(body): Json<UnpackBody>,
+) -> Result<Json<SteerReport>, ApiError> {
+    let want_cb = body.packet.unicode.is_some() || body.codebook.is_some();
+    let cb = open_codebook(body.codebook.as_deref(), want_cb)?;
+    let override_id = body
+        .id_override
+        .as_deref()
+        .map(Uuid::parse_str)
+        .transpose()?;
+    Ok(Json(service.unpack_packet(
+        &body.packet,
+        cb.as_ref(),
+        override_id,
+    )?))
 }

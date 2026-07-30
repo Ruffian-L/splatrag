@@ -42,6 +42,23 @@ pub struct MemoryRecord {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RecallFilters {
     pub domains: Vec<String>,
+    /// Which archive a memory came from: `claude`, `grok-export`, `gemini`, `claude-memory`, …
+    ///
+    /// This is the axis for "show me only the Claude thread". It is a *relationship* filter, not a
+    /// speaker filter: a source contains both sides of the conversation. Measured on this store,
+    /// `claude` is 778 human / 778 assistant and `grok-export` is 453 / 443 — filtering by source
+    /// keeps the human in, because the human is half of every thread.
+    ///
+    /// `source` is also part of the identity key (UUID v5 over `{source}\0{source_key}`), so it is
+    /// stable across re-imports and cannot drift.
+    pub sources: Vec<String>,
+    /// Who produced the text: `human`, `assistant`.
+    ///
+    /// **This is the filter that removes a participant.** Use it deliberately — asking for
+    /// `assistant` only is asking for one voice with the other party stripped out, which is a
+    /// different thing from asking for a conversation. Prefer [`RecallFilters::sources`] when what
+    /// you want is "that relationship's memories".
+    pub speakers: Vec<String>,
     pub models: Vec<String>,
     pub basin_id: Option<String>,
     pub conversation_id: Option<String>,
@@ -107,6 +124,23 @@ impl MemoryRecord {
 
     pub fn matches(&self, filters: &RecallFilters) -> bool {
         if !filters.domains.is_empty() && !filters.domains.iter().any(|d| d == &self.domain) {
+            return false;
+        }
+        if !filters.sources.is_empty()
+            && !filters.sources.iter().any(|wanted| wanted == &self.source)
+        {
+            return false;
+        }
+        // Speaker is normalized to lowercase at ingest (the same export writes both `assistant` and
+        // `ASSISTANT`), so compare case-insensitively rather than trusting the caller to know that.
+        if !filters.speakers.is_empty()
+            && !self.speaker.as_ref().is_some_and(|speaker| {
+                filters
+                    .speakers
+                    .iter()
+                    .any(|wanted| wanted.eq_ignore_ascii_case(speaker))
+            })
+        {
             return false;
         }
         if !filters.models.is_empty()

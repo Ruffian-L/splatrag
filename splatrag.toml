@@ -17,7 +17,7 @@ timeout_seconds = 180
 
 [labeling]
 url = "http://127.0.0.1:8082"
-model = "gemma-3-4b-it-q4_0.gguf"
+model = "gemma-4-12b-it-Q4_K_M.gguf"
 enabled = true
 timeout_seconds = 180
 

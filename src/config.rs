@@ -216,6 +216,12 @@ impl AppConfig {
         self.data_dir.join("quarantine").join("ingest-errors.jsonl")
     }
 
+    /// OCR results, keyed by asset id. Derived state: expensive to rebuild (hours of vision model
+    /// time), but never authoritative — deleting it costs time, not memories.
+    pub fn ocr_cache_path(&self) -> PathBuf {
+        self.data_dir.join("derived").join("extracted.jsonl")
+    }
+
     pub fn lexical_path(&self) -> PathBuf {
         self.data_dir.join("indexes").join("tantivy")
     }

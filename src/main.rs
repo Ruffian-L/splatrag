@@ -103,6 +103,12 @@ enum Command {
         limit: usize,
         #[arg(long)]
         domain: Vec<String>,
+        /// Only this archive: claude | grok-export | gemini | claude-memory. Repeatable.
+        #[arg(long)]
+        source: Vec<String>,
+        /// Only this speaker: human | assistant. Repeatable.
+        #[arg(long)]
+        speaker: Vec<String>,
         #[arg(long)]
         model: Vec<String>,
         #[arg(long)]
@@ -130,6 +136,13 @@ enum Command {
         budget: f32,
         #[arg(long)]
         domain: Vec<String>,
+        /// Only this archive: claude | grok-export | gemini | claude-memory. Repeatable.
+        /// Keeps both sides of the conversation — a source is a relationship, not a speaker.
+        #[arg(long)]
+        source: Vec<String>,
+        /// Only this speaker: human | assistant. Repeatable. This one drops the other party.
+        #[arg(long)]
+        speaker: Vec<String>,
         #[arg(long)]
         basin: Option<String>,
         /// Write to a file instead of stdout.
@@ -309,6 +322,8 @@ async fn main() -> Result<()> {
             query,
             limit,
             domain,
+            source,
+            speaker,
             model,
             basin,
             conversation,
@@ -316,6 +331,8 @@ async fn main() -> Result<()> {
             let service = MemoryService::open(config)?;
             let filters = RecallFilters {
                 domains: domain,
+                sources: source,
+                speakers: speaker,
                 models: model,
                 basin_id: basin,
                 conversation_id: conversation,
@@ -333,12 +350,16 @@ async fn main() -> Result<()> {
             text_budget,
             budget,
             domain,
+            source,
+            speaker,
             basin,
             out,
         } => {
             let service = MemoryService::open(config)?;
             let filters = RecallFilters {
                 domains: domain,
+                sources: source,
+                speakers: speaker,
                 basin_id: basin,
                 ..RecallFilters::default()
             };

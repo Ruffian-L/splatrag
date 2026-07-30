@@ -7,8 +7,11 @@ set -u
 cd "$(dirname "$0")"
 
 LLAMA="${LLAMA:-$HOME/.local/bin/llama-server}"
-EMBED_MODEL="${EMBED_MODEL:-/media/ruffianl/ghost_team/models/Qwen3-Embedding-8B-Q8_0.gguf}"
-LABEL_MODEL="${LABEL_MODEL:-$HOME/Downloads/gemma-3-4b-it-q4_0.gguf}"
+MODELS="${MODELS:-/media/ruffianl/ghost_team/models}"
+EMBED_MODEL="${EMBED_MODEL:-$MODELS/Qwen3-Embedding-8B-Q8_0.gguf}"
+# Gemma 4 12B: the labeler and, later, the distill pass. The old gemma-3-4b path pointed at
+# ~/Downloads, which no longer holds the file — models live under $MODELS now.
+LABEL_MODEL="${LABEL_MODEL:-$MODELS/gemma-4-12b-it-Q4_K_M.gguf}"
 LOGS="${LOGS:-/tmp/splatrag-logs}"
 mkdir -p "$LOGS"
 
@@ -24,7 +27,12 @@ start_model() {          # port, model, extra args
 }
 
 echo "models:"
-start_model 8081 "$EMBED_MODEL" "--embedding --pooling last"
+# --ubatch-size is load-bearing, not tuning. llama-server clamps n_batch down to n_ubatch when
+# embeddings are enabled, and the default 512 means any single memory longer than ~512 tokens comes
+# back as a 400 and aborts the whole ingest run. That silently truncated the Grok import at 896 of
+# 1819 records — and long assistant messages are exactly where the substance is. n_ctx_slot is
+# 40960, so this costs headroom we already have.
+start_model 8081 "$EMBED_MODEL" "--embedding --pooling last --ubatch-size 8192 --batch-size 8192"
 start_model 8082 "$LABEL_MODEL" "--ctx-size 4096"
 
 printf "  waiting for embedder"

@@ -136,6 +136,107 @@ async fn call_tool(params: Value, service: &MemoryService) -> Result<Value, (i32
             serde_json::to_value(service.remember(record).await.map_err(internal_error)?)
                 .map_err(internal_error)?
         }
+        "steer" => {
+            // gain inverts/amplifies semantics; mass (optional) repels if negative — independent
+            let memory_id = arguments
+                .get("memory_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| (-32602, "steer requires memory_id".into()))?;
+            let id = uuid::Uuid::parse_str(memory_id)
+                .map_err(|error| (-32602, format!("invalid memory_id: {error}")))?;
+            let gain = arguments
+                .get("gain")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0) as f32;
+            let op = arguments
+                .get("op")
+                .and_then(Value::as_str)
+                .map(crate::inversion::InversionOp::parse)
+                .transpose()
+                .map_err(|error| (-32602, error.to_string()))?
+                .unwrap_or_default();
+            let mass = arguments
+                .get("mass")
+                .and_then(Value::as_f64)
+                .map(|value| value as f32);
+            let opts = crate::service::SteerOpts {
+                gain,
+                op,
+                mass,
+                basin_id: string_argument(&arguments, "basin_id"),
+                basin_locked: arguments
+                    .get("lock")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            };
+            serde_json::to_value(service.steer(id, opts).await.map_err(internal_error)?)
+                .map_err(internal_error)?
+        }
+        "pack_64" => {
+            let memory_id = arguments
+                .get("memory_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| (-32602, "pack_64 requires memory_id".into()))?;
+            let id = uuid::Uuid::parse_str(memory_id)
+                .map_err(|error| (-32602, format!("invalid memory_id: {error}")))?;
+            let unicode = arguments
+                .get("unicode")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let cb = if unicode {
+                let path = arguments
+                    .get("codebook")
+                    .and_then(Value::as_str)
+                    .unwrap_or(
+                        "/media/ruffianl/backup_sandisk/02_projects/niodoo_team_build_code_backup_20260608-150015/worktree/niodv4/experiments/encode_decode/niodv4/results/codebook_256.json",
+                    );
+                Some(
+                    crate::packet::VqCodebook::load_json(path).map_err(internal_error)?,
+                )
+            } else {
+                None
+            };
+            serde_json::to_value(
+                service
+                    .pack_packet(id, cb.as_ref())
+                    .map_err(internal_error)?,
+            )
+            .map_err(internal_error)?
+        }
+        "unpack_64" => {
+            let packet: crate::packet::MemoryPacket = arguments
+                .get("packet")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|error| (-32602, error.to_string()))?
+                .ok_or_else(|| (-32602, "unpack_64 requires packet object".into()))?;
+            let override_id = arguments
+                .get("memory_id")
+                .and_then(Value::as_str)
+                .map(uuid::Uuid::parse_str)
+                .transpose()
+                .map_err(|error| (-32602, format!("invalid memory_id: {error}")))?;
+            let cb = if packet.unicode.is_some() {
+                let path = arguments
+                    .get("codebook")
+                    .and_then(Value::as_str)
+                    .unwrap_or(
+                        "/media/ruffianl/backup_sandisk/02_projects/niodoo_team_build_code_backup_20260608-150015/worktree/niodv4/experiments/encode_decode/niodv4/results/codebook_256.json",
+                    );
+                Some(
+                    crate::packet::VqCodebook::load_json(path).map_err(internal_error)?,
+                )
+            } else {
+                None
+            };
+            serde_json::to_value(
+                service
+                    .unpack_packet(&packet, cb.as_ref(), override_id)
+                    .map_err(internal_error)?,
+            )
+            .map_err(internal_error)?
+        }
         "recall" => {
             let query = arguments
                 .get("query")
@@ -199,6 +300,48 @@ fn tool_list() -> Value {
                         "conversation_id": {"type": "string"}
                     },
                     "required": ["text"]
+                }
+            },
+            {
+                "name": "steer",
+                "description": "Steer one splat. Negative gain inverts semantics (OI); negative mass repels. Independent knobs.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "memory_id": {"type": "string"},
+                        "gain": {"type": "number", "description": "negative = invert, positive = amplify"},
+                        "op": {"type": "string", "description": "polarity | householder | negative_gain"},
+                        "mass": {"type": "number", "description": "if set negative, dream repels; not implied by gain"},
+                        "basin_id": {"type": "string"},
+                        "lock": {"type": "boolean"}
+                    },
+                    "required": ["memory_id"]
+                }
+            },
+            {
+                "name": "pack_64",
+                "description": "Pack a splat into a 64D memory packet (optional VQ Unicode).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "memory_id": {"type": "string"},
+                        "unicode": {"type": "boolean"},
+                        "codebook": {"type": "string"}
+                    },
+                    "required": ["memory_id"]
+                }
+            },
+            {
+                "name": "unpack_64",
+                "description": "Apply a 64D packet onto a splat.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "packet": {"type": "object"},
+                        "memory_id": {"type": "string"},
+                        "codebook": {"type": "string"}
+                    },
+                    "required": ["packet"]
                 }
             },
             {

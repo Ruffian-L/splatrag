@@ -2,8 +2,27 @@
 name = "splatrag"
 version = "0.1.0"
 edition = "2024"
-description = "Local Gaussian-splat AI memory store"
+description = "Local Gaussian-splat AI memory store: append-only cold log, BM25 + HNSW hybrid retrieval, a splat field that repels noise instead of deleting it, and a picker that decides which memory steers a live model and how hard."
 license = "MIT"
+authors = ["Jason Van Pham <jasonvanpham@niodoo.com>"]
+repository = "https://github.com/Ruffian-L/splatrag"
+homepage = "https://github.com/Ruffian-L/splatrag"
+readme = "README.md"
+keywords = ["memory", "retrieval", "embeddings", "hnsw", "steering"]
+categories = ["database-implementations", "science"]
+# Publishing ships source, not state. Without this, `cargo package` would sweep in whatever local
+# indexes, logs and scratch files happen to exist — including a personal memory store.
+exclude = [
+    "data/",
+    "data-*/",
+    "datasets/",
+    "models/",
+    "logs/",
+    "viz/",
+    "*.log",
+    "splatrag.toml",
+    "splatrag.*.toml",
+]
 
 [workspace]
 resolver = "2"

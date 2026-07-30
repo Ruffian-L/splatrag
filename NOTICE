@@ -1,0 +1,102 @@
+SplatRAG — Third-Party Notices
+==============================
+
+Added 2026-07-29. The repository previously declared `license = "MIT"` in Cargo.toml with no LICENSE
+file and no third-party notices at all. That was an omission on our side; this file and LICENSE
+correct it, and we will keep the notices current.
+
+
+License cheat sheet (three different things — do not mix them up)
+-----------------------------------------------------------------
+
+1. **This project's code** — MIT. See LICENSE.
+2. **Rust dependencies** — each carries its own license, listed below. All are compatible with MIT.
+3. **Model weights** — NOT distributed here, NOT covered by this project's license. SplatRAG calls
+   local `llama-server` instances that you run and whose models you obtain yourself. Qwen3-Embedding,
+   Gemma and anything else you point it at have their own terms. Read them.
+
+
+External programs SplatRAG requires at runtime
+----------------------------------------------
+
+These are not Rust crates, so `cargo metadata` does not list them. SplatRAG does not bundle,
+redistribute or link them — it makes HTTP calls to servers you start yourself — but it does not
+function without them, so they are credited here.
+
+  llama.cpp / llama-server    MIT    https://github.com/ggml-org/llama.cpp
+
+Used for both local model roles: the embedding server on :8081 and the basin-labeling / vision
+server on :8082 (see `start.sh`). Also used for gemma-diffusion testing during this project's
+research. The OCR path in `src/embedding.rs` depends on llama.cpp's `--mmproj` multimodal projector
+support.
+
+  Qdrant                      Apache-2.0    https://github.com/qdrant/qdrant
+
+Optional. `src/qdrant.rs` talks to it over HTTP for scoped cosine search when
+`[qdrant] enabled = true` and something is listening. SplatRAG degrades to local-only when it is
+absent.
+
+
+Runtime dependencies (Rust crates)
+----------------------------------
+
+  anyhow            MIT OR Apache-2.0
+  axum              MIT
+  bytemuck          Zlib OR Apache-2.0 OR MIT
+  chrono            MIT OR Apache-2.0
+  clap              MIT OR Apache-2.0
+  fast-hnsw         MIT
+  nalgebra          BSD-3-Clause          <- see note below
+  rayon             MIT OR Apache-2.0
+  reqwest           MIT OR Apache-2.0
+  serde             MIT OR Apache-2.0
+  serde_json        MIT OR Apache-2.0
+  sha2              MIT OR Apache-2.0
+  tantivy           MIT
+  tokio             MIT
+  toml              MIT OR Apache-2.0
+  tower-http        MIT
+  uuid              Apache-2.0 OR MIT
+
+Development dependencies
+
+  tempfile          MIT OR Apache-2.0
+
+Regenerate this list with:
+
+  cargo metadata --format-version 1 | \
+    python3 -c "import json,sys; [print(f\"{p['name']:18}{p.get('license')}\") for p in json.load(sys.stdin)['packages']]"
+
+
+nalgebra (BSD-3-Clause)
+-----------------------
+
+The only non-MIT/Apache dependency. BSD-3-Clause carries a no-endorsement clause: nalgebra's authors
+and contributors have not endorsed SplatRAG, and their names must not be used to promote it. We do
+not redistribute nalgebra's source; it is resolved from crates.io at build time.
+
+nalgebra provides the quaternion and vector math behind splat orientation in `src/geometry.rs`.
+
+
+fast-hnsw (MIT)
+---------------
+
+Provides the approximate-nearest-neighbour graph that `src/ann.rs` wraps as `KeyedAnn`. SplatRAG uses
+it with UUID strings as labels so that identity is stable across index rebuilds — insertion order is
+an internal detail of the crate and is deliberately not relied upon.
+
+
+tantivy (MIT)
+-------------
+
+Provides the BM25 lexical index in `src/lexical.rs`, which is one of the two arms of the hybrid
+retrieval this project is built around.
+
+
+Prior art this project builds on
+--------------------------------
+
+The inversion operators in `src/inversion.rs` are ported from measurements made in
+https://github.com/Ruffian-L/ontological-inversion rather than re-derived. The 64D packet and
+Unicode/VQ transport contract follows the niodv4 line of work. Attribution for the people and
+systems involved is in CREDITS.md.
