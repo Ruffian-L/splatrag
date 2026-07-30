@@ -33,6 +33,21 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Read the archive's images with the local vision model, into a resumable cache.
+    ///
+    /// Separate from `ingest` on purpose: this runs for hours, and re-running an ingest must not
+    /// mean re-running OCR. Safe to interrupt and restart — finished assets are skipped.
+    Extract {
+        /// Export root, or any directory of assets.
+        path: PathBuf,
+        /// How many images to read at once. The server was started with `n_slots`; going past it
+        /// queues rather than parallelises.
+        #[arg(long, default_value_t = 4)]
+        concurrency: usize,
+        /// Stop after this many newly-read images.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
     Remember {
         text: String,
         #[arg(long, default_value = "chat")]
@@ -46,6 +61,42 @@ enum Command {
         #[arg(long)]
         source_key: Option<String>,
     },
+    /// Steer one existing splat. Gain inverts/amplifies semantics; mass repels if negative.
+    /// These are independent: `gain=-0.2` does not set negative mass.
+    Steer {
+        memory_id: String,
+        /// Negative = ontological inversion; positive = amplify. Default 0 = leave semantics.
+        #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
+        gain: f32,
+        /// polarity | householder | negative_gain
+        #[arg(long, default_value = "polarity")]
+        op: String,
+        /// If set, overwrite mass. Negative mass repels in dream.
+        #[arg(long, allow_hyphen_values = true)]
+        mass: Option<f32>,
+        #[arg(long)]
+        basin: Option<String>,
+        #[arg(long)]
+        lock: bool,
+    },
+    /// Pack a splat into a 64D memory packet (JSON). Optional VQ Unicode via --codebook.
+    Pack64 {
+        memory_id: String,
+        /// niodv4 codebook_256.json path for PUA transport
+        #[arg(long)]
+        codebook: Option<PathBuf>,
+        #[arg(long)]
+        unicode: bool,
+    },
+    /// Apply a 64D packet JSON onto a splat (file path or "-" for stdin).
+    Unpack64 {
+        packet: PathBuf,
+        /// Override memory id in the packet
+        #[arg(long)]
+        memory_id: Option<String>,
+        #[arg(long)]
+        codebook: Option<PathBuf>,
+    },
     Recall {
         query: String,
         #[arg(long, default_value_t = 10)]
@@ -58,6 +109,32 @@ enum Command {
         basin: Option<String>,
         #[arg(long)]
         conversation: Option<String>,
+    },
+    /// Pick memories to steer a live model toward, with the knobs to apply them.
+    ///
+    /// Writes a pick set carrying each memory's **text** — the consumer embeds it with its own
+    /// encoder. `semantics_64` is telemetry; it is not injectable into another model's residual.
+    Pick {
+        prompt: String,
+        #[arg(long, default_value_t = 3)]
+        limit: usize,
+        /// Drop candidates scoring below this.
+        #[arg(long, default_value_t = 0.0)]
+        min_score: f32,
+        /// Characters of memory text per pick.
+        #[arg(long, default_value_t = splatrag::pick::DEFAULT_TEXT_BUDGET)]
+        text_budget: usize,
+        /// Total steering α shared across all picks — divided, not paid per pick. Sweep this
+        /// against --limit to separate "more memories" from "more total push".
+        #[arg(long, default_value_t = splatrag::pick::DEFAULT_GAIN_BUDGET)]
+        budget: f32,
+        #[arg(long)]
+        domain: Vec<String>,
+        #[arg(long)]
+        basin: Option<String>,
+        /// Write to a file instead of stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
     Dream {
         #[arg(long)]
@@ -127,6 +204,13 @@ async fn main() -> Result<()> {
                 );
             }
         }
+        Command::Extract {
+            path,
+            concurrency,
+            limit,
+        } => {
+            run_extract(&config, &path, concurrency, limit).await?;
+        }
         Command::Remember {
             text,
             domain,
@@ -152,6 +236,75 @@ async fn main() -> Result<()> {
                 serde_json::to_string_pretty(&service.remember(record).await?)?
             );
         }
+        Command::Steer {
+            memory_id,
+            gain,
+            op,
+            mass,
+            basin,
+            lock,
+        } => {
+            let service = MemoryService::open(config)?;
+            let id = uuid::Uuid::parse_str(&memory_id)
+                .with_context(|| format!("invalid memory id {memory_id}"))?;
+            let opts = splatrag::service::SteerOpts {
+                gain,
+                op: splatrag::inversion::InversionOp::parse(&op)?,
+                mass,
+                basin_id: basin,
+                basin_locked: lock,
+            };
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&service.steer(id, opts).await?)?
+            );
+        }
+        Command::Pack64 {
+            memory_id,
+            codebook,
+            unicode,
+        } => {
+            let service = MemoryService::open(config)?;
+            let id = uuid::Uuid::parse_str(&memory_id)
+                .with_context(|| format!("invalid memory id {memory_id}"))?;
+            let cb = load_codebook(codebook, unicode)?;
+            let packet = service.pack_packet(id, cb.as_ref())?;
+            println!("{}", serde_json::to_string_pretty(&packet)?);
+        }
+        Command::Unpack64 {
+            packet,
+            memory_id,
+            codebook,
+        } => {
+            let service = MemoryService::open(config)?;
+            let raw = if packet.as_os_str() == "-" {
+                let mut buf = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+                buf
+            } else {
+                std::fs::read_to_string(&packet)
+                    .with_context(|| format!("failed to read {}", packet.display()))?
+            };
+            let packet: splatrag::packet::MemoryPacket = serde_json::from_str(&raw)?;
+            let cb = if packet.unicode.is_some() {
+                load_codebook(codebook, true)?
+            } else {
+                load_codebook(codebook, false)?
+            };
+            let override_id = memory_id
+                .as_deref()
+                .map(uuid::Uuid::parse_str)
+                .transpose()
+                .context("invalid --memory-id")?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&service.unpack_packet(
+                    &packet,
+                    cb.as_ref(),
+                    override_id
+                )?)?
+            );
+        }
         Command::Recall {
             query,
             limit,
@@ -172,6 +325,43 @@ async fn main() -> Result<()> {
                 "{}",
                 serde_json::to_string_pretty(&service.recall(&query, limit, &filters).await?)?
             );
+        }
+        Command::Pick {
+            prompt,
+            limit,
+            min_score,
+            text_budget,
+            budget,
+            domain,
+            basin,
+            out,
+        } => {
+            let service = MemoryService::open(config)?;
+            let filters = RecallFilters {
+                domains: domain,
+                basin_id: basin,
+                ..RecallFilters::default()
+            };
+            let pick_config = splatrag::pick::PickConfig {
+                limit,
+                min_score,
+                text_budget,
+                gain_budget: budget,
+            };
+            let picks = service.pick(&prompt, &filters, &pick_config).await?;
+            let json = serde_json::to_string_pretty(&picks)?;
+            match out {
+                Some(path) => {
+                    std::fs::write(&path, &json)?;
+                    eprintln!(
+                        "{} pick(s), confidence {:.3} → {}",
+                        picks.picks.len(),
+                        picks.confidence,
+                        path.display()
+                    );
+                }
+                None => println!("{json}"),
+            }
         }
         Command::Dream { label } => {
             let service = MemoryService::open(config)?;
@@ -242,6 +432,127 @@ async fn main() -> Result<()> {
             run_handshake(config, dataset, poison, k, limit, no_ingest).await?;
         }
     }
+    Ok(())
+}
+
+/// Default niodv4 juice codebook (256 × 64, PUA transport). Override with --codebook.
+const DEFAULT_CODEBOOK: &str = "/media/ruffianl/backup_sandisk/02_projects/niodoo_team_build_code_backup_20260608-150015/worktree/niodv4/experiments/encode_decode/niodv4/results/codebook_256.json";
+
+fn load_codebook(
+    path: Option<PathBuf>,
+    want: bool,
+) -> Result<Option<splatrag::packet::VqCodebook>> {
+    if !want && path.is_none() {
+        return Ok(None);
+    }
+    let path = path.unwrap_or_else(|| PathBuf::from(DEFAULT_CODEBOOK));
+    Ok(Some(splatrag::packet::VqCodebook::load_json(&path)?))
+}
+
+/// OCR pass for export assets. Separate from ingest: long-running, resumable.
+async fn run_extract(
+    config: &AppConfig,
+    path: &std::path::Path,
+    concurrency: usize,
+    limit: Option<usize>,
+) -> Result<()> {
+    use splatrag::embedding::LabelingClient;
+    use splatrag::ingest::extract::{self, MediaKind, OcrCache};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Semaphore;
+
+    let labeler = LabelingClient::new(config.labeling.clone())?;
+    if !labeler.enabled() {
+        anyhow::bail!("labeling/vision model is disabled; enable [labeling] to OCR");
+    }
+    let mut cache = OcrCache::open(config.ocr_cache_path())?;
+    let concurrency = concurrency.max(1);
+    let semaphore = Arc::new(Semaphore::new(concurrency));
+    let done = Arc::new(AtomicUsize::new(cache.len()));
+    let newly = Arc::new(AtomicUsize::new(0));
+
+    // Collect image assets under path (export layout or flat tree).
+    let mut jobs = Vec::new();
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if dir.is_file() {
+            continue;
+        }
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let child = entry.path();
+            if child.is_dir() {
+                // Grok export: <uuid>/content with no extension
+                let content = child.join("content");
+                if content.is_file() {
+                    let asset_id = child
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    if !cache.contains(&asset_id) {
+                        jobs.push((asset_id, content));
+                    }
+                } else {
+                    stack.push(child);
+                }
+            }
+        }
+    }
+    if let Some(max) = limit {
+        jobs.truncate(max);
+    }
+    eprintln!(
+        "extract: {} cached, {} pending (concurrency={concurrency})",
+        cache.len(),
+        jobs.len()
+    );
+
+    let mut handles = Vec::new();
+    for (asset_id, blob) in jobs {
+        let permit = semaphore.clone().acquire_owned().await?;
+        let labeler = labeler.clone();
+        let newly = Arc::clone(&newly);
+        let done = Arc::clone(&done);
+        handles.push(tokio::spawn(async move {
+            let _permit = permit;
+            let bytes = tokio::fs::read(&blob).await?;
+            let kind = extract::sniff(&bytes);
+            if !kind.is_image() {
+                return Ok::<_, anyhow::Error>(None);
+            }
+            let text = labeler.read_image(&bytes, kind.media_type()).await?;
+            let entry = extract::Extracted {
+                asset_id,
+                media_type: kind.media_type().into(),
+                kind,
+                sha256: splatrag::record::sha256_hex(&bytes),
+                bytes: bytes.len() as u64,
+                text: Some(text),
+            };
+            newly.fetch_add(1, Ordering::Relaxed);
+            done.fetch_add(1, Ordering::Relaxed);
+            Ok(Some(entry))
+        }));
+    }
+
+    for handle in handles {
+        match handle.await? {
+            Ok(Some(entry)) => {
+                cache.append(entry)?;
+                eprint!(".");
+            }
+            Ok(None) => {}
+            Err(error) => eprintln!("\nextract error: {error:#}"),
+        }
+    }
+    eprintln!(
+        "\nextract done: {} new, {} total in cache",
+        newly.load(Ordering::Relaxed),
+        cache.len()
+    );
+    // Silence unused import if MediaKind only used via kind
+    let _ = MediaKind::Png;
     Ok(())
 }
 

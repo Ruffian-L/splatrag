@@ -48,10 +48,26 @@ pub fn discover_basins(
         .collect();
     let mut claimed_previous = HashSet::new();
     let mut basins = Vec::new();
+    // Locked members keep their basin_id even if the free graph would reassign them.
+    // Collect them first so free components can still form around unlocked points.
+    let locked: Vec<(usize, String)> = splats
+        .iter()
+        .enumerate()
+        .filter_map(|(index, splat)| {
+            if splat.basin_locked {
+                splat.basin_id.clone().map(|id| (index, id))
+            } else {
+                None
+            }
+        })
+        .collect();
+
     for mut members in components.into_values() {
         if members.len() < config.min_basin_size {
             for index in members {
-                splats[index].basin_id = None;
+                if !splats[index].basin_locked {
+                    splats[index].basin_id = None;
+                }
             }
             continue;
         }
@@ -81,7 +97,9 @@ pub fn discover_basins(
                 .map(|index| previous[index].id.clone())
                 .unwrap_or_else(|| stable_basin_id(&ids));
             for index in &chunk {
-                splats[*index].basin_id = Some(basin_id.clone());
+                if !splats[*index].basin_locked {
+                    splats[*index].basin_id = Some(basin_id.clone());
+                }
             }
             let centroid = centroid(&chunk, splats);
             let spread = chunk
@@ -128,6 +146,30 @@ pub fn discover_basins(
             });
         }
     }
+    // Re-attach locked members to their declared basins (create a shell basin if needed).
+    for (index, basin_id) in &locked {
+        splats[*index].basin_id = Some(basin_id.clone());
+        if let Some(basin) = basins.iter_mut().find(|b| b.id == *basin_id) {
+            if !basin.member_ids.contains(&splats[*index].memory_id) {
+                basin.member_ids.push(splats[*index].memory_id);
+            }
+        } else {
+            basins.push(Basin {
+                id: basin_id.clone(),
+                parent_id: None,
+                label: format!("locked-{}", &basin_id[..basin_id.len().min(8)]),
+                path: "memory/locked".into(),
+                summary: String::new(),
+                label_state: "locked".into(),
+                stability: 1.0,
+                centroid: splats[*index].position,
+                member_ids: vec![splats[*index].memory_id],
+                representative_ids: vec![splats[*index].memory_id],
+                updated_at: Utc::now(),
+            });
+        }
+    }
+
     basins.sort_by(|a, b| a.id.cmp(&b.id));
     (basins, intervals)
 }
@@ -310,6 +352,8 @@ mod tests {
             color_rgba: [255; 4],
             mass: 1.0,
             radiance: 1.0,
+            gain: 0.0,
+            basin_locked: false,
             domain: "chat".into(),
             basin_id: None,
             lineage: vec![],

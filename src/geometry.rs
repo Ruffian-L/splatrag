@@ -32,6 +32,19 @@ pub struct Splat {
     pub color_rgba: [u8; 4],
     pub mass: f32,
     pub radiance: f32,
+    /// Steering α applied to **semantics only**, and **0.0 means unsteered**.
+    /// Positive amplifies along the concept axis; negative runs ontological inversion
+    /// (the sorrowful flip). Does **not** set mass — negative mass is a separate knob
+    /// and is what repels in dream.
+    ///
+    /// Always the α that was actually applied, so `|gain| <= ALPHA_MAX` (0.35) for
+    /// anything this crate steered. That invariant is what makes the 1.0 migration in
+    /// `HotState::load` unambiguous.
+    #[serde(default)]
+    pub gain: f32,
+    /// When true, dream/basin discovery must not reassign `basin_id`.
+    #[serde(default)]
+    pub basin_locked: bool,
     pub domain: String,
     pub basin_id: Option<String>,
     #[serde(default)]
@@ -209,6 +222,12 @@ impl Splat {
             color_rgba: domain_color(&record.domain),
             mass: 1.0,
             radiance: 1.0,
+            // Unsteered. Mass keeps 1.0 as its neutral (it is a physics multiplier);
+            // gain is a steering α, so its neutral is zero. Different meanings, different
+            // neutrals — conflating them is what made every fresh splat read as
+            // "amplified" to downstream consumers.
+            gain: 0.0,
+            basin_locked: false,
             domain: record.domain.clone(),
             basin_id: None,
             lineage: vec![record.id],
@@ -216,6 +235,15 @@ impl Splat {
     }
 
     pub fn packed(&self) -> SplatGeometry {
+        // physics_props[1] mid-centered signed mass (repulsion knob): 128≈0, high=+, low=−.
+        // [3] bit0 = basin_locked, bit1 = negative mass (repels), bit2 = negative gain (inverted).
+        let signed_mass_byte = {
+            let t = self.mass.tanh();
+            ((t + 1.0) * 0.5 * 255.0).round().clamp(0.0, 255.0) as u8
+        };
+        let flags = (self.basin_locked as u8)
+            | (((self.mass < 0.0) as u8) << 1)
+            | (((self.gain < 0.0) as u8) << 2);
         SplatGeometry {
             position: self.position,
             scale: self.scale,
@@ -223,9 +251,9 @@ impl Splat {
             color_rgba: self.color_rgba,
             physics_props: [
                 unit_byte(self.radiance / (self.radiance + 1.0)),
-                unit_byte(self.mass / (self.mass + 1.0)),
+                signed_mass_byte,
                 self.basin_id.is_some() as u8,
-                0,
+                flags,
             ],
         }
     }
@@ -237,8 +265,24 @@ impl HotState {
             return Ok(Self::default());
         }
         let bytes = fs::read(path)?;
-        serde_json::from_slice(&bytes)
-            .with_context(|| format!("invalid hot state {}", path.display()))
+        let mut state: Self = serde_json::from_slice(&bytes)
+            .with_context(|| format!("invalid hot state {}", path.display()))?;
+        state.migrate_neutral_gain();
+        Ok(state)
+    }
+
+    /// Stores written before `gain` became a steering α used 1.0 as "never steered".
+    ///
+    /// Safe to rewrite as 0.0 because a steered splat records the α that was *applied*, and
+    /// `clamp_alpha` caps that at 0.35 — so no genuinely steered splat can hold exactly 1.0.
+    /// Without this every legacy splat reports `gain: 1.0`, which reads downstream as maximum
+    /// amplification and makes `collapse_risk` (|α| >= 0.40) fire on untouched memories.
+    fn migrate_neutral_gain(&mut self) {
+        for splat in &mut self.splats {
+            if splat.gain == 1.0 {
+                splat.gain = 0.0;
+            }
+        }
     }
 
     pub fn save(&self, json_path: &Path, packed_path: &Path) -> Result<()> {
@@ -415,5 +459,66 @@ mod tests {
     #[test]
     fn packed_geometry_keeps_historical_48_byte_contract() {
         assert_eq!(std::mem::size_of::<SplatGeometry>(), 48);
+    }
+
+    /// A legacy store's `gain: 1.0` means "never steered", not "amplify hard".
+    #[test]
+    fn legacy_neutral_gain_migrates_to_zero_and_real_alphas_survive() {
+        let json = serde_json::json!({
+            "version": 1,
+            "dream_cycle": 0,
+            "last_dream_at": null,
+            "kinetic_energy": 0.0,
+            "basins": [],
+            "splats": [
+                splat_json("00000000-0000-0000-0000-000000000001", 1.0),
+                splat_json("00000000-0000-0000-0000-000000000002", -0.2),
+                splat_json("00000000-0000-0000-0000-000000000003", 0.35),
+            ]
+        });
+        let mut state: HotState = serde_json::from_value(json).unwrap();
+        state.migrate_neutral_gain();
+
+        // Legacy neutral rewritten; genuine αs untouched. 1.0 is unreachable for a steered
+        // splat because `clamp_alpha` caps the applied magnitude at ALPHA_MAX (0.35).
+        assert_eq!(state.splats[0].gain, 0.0);
+        assert_eq!(state.splats[1].gain, -0.2);
+        assert_eq!(state.splats[2].gain, 0.35);
+        assert!(crate::inversion::ALPHA_MAX < 1.0);
+
+        // The whole point of the migration: an untouched memory must not look collapse-risky.
+        assert!(!crate::inversion::collapse_risk(state.splats[0].gain));
+        assert!(!crate::inversion::collapse_risk(state.splats[1].gain));
+    }
+
+    /// A fresh splat is unsteered, and mass keeps its own separate neutral.
+    #[test]
+    fn fresh_splat_is_unsteered_but_still_has_mass() {
+        let record = crate::record::MemoryRecord::new("test", "gain-neutral", "hello");
+        let splat = Splat::from_embedding(&record, &vec![0.125; 64]).unwrap();
+        assert_eq!(splat.gain, 0.0);
+        assert_eq!(splat.mass, 1.0);
+        assert!(!crate::inversion::collapse_risk(splat.gain));
+        // Sign-derived "inverted" flag must not trip on a neutral splat.
+        assert_eq!(splat.packed().physics_props[3] & 0b100, 0);
+    }
+
+    fn splat_json(id: &str, gain: f32) -> serde_json::Value {
+        serde_json::json!({
+            "memory_id": id,
+            "semantics": vec![0.125f32; 64],
+            "position": [0.0, 0.0, 0.0],
+            "velocity": [0.0, 0.0, 0.0],
+            "scale": [1.0, 1.0, 1.0],
+            "rotation": [0.0, 0.0, 0.0, 1.0],
+            "color_rgba": [255, 255, 255, 255],
+            "mass": 1.0,
+            "radiance": 1.0,
+            "gain": gain,
+            "basin_locked": false,
+            "domain": "chat",
+            "basin_id": null,
+            "lineage": []
+        })
     }
 }

@@ -3,12 +3,15 @@ use crate::cold_store::ColdStore;
 use crate::config::AppConfig;
 use crate::embedding::{EmbeddingClient, LabelingClient, matryoshka64};
 use crate::geometry::{Basin, HotState};
+use crate::inversion::{self, InversionOp, collapse_risk};
 use crate::lexical::LexicalIndex;
+use crate::packet::{MemoryPacket, VqCodebook};
 use crate::physics::{DreamReport, dream};
+use crate::pick::{MemoryPickSet, PickConfig};
 use crate::qdrant::QdrantIndex;
 use crate::record::{MemoryRecord, RecallFilters, RecallHit};
 use crate::retrieval::RetrievalEngine;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -45,6 +48,45 @@ pub struct RememberReport {
     pub requested: usize,
     pub appended: usize,
     pub total_records: usize,
+}
+
+/// Independent knobs for the steering lane.
+///
+/// - `gain` → semantic invert/amplify (ontological inversion when negative)
+/// - `mass` → if set, physics mass; negative mass **repels** in dream
+/// - they are never coupled: neg gain does not set neg mass
+#[derive(Debug, Clone)]
+pub struct SteerOpts {
+    pub gain: f32,
+    pub op: InversionOp,
+    /// When `Some`, overwrite splat mass (use negative to repel). `None` leaves mass alone.
+    pub mass: Option<f32>,
+    pub basin_id: Option<String>,
+    pub basin_locked: bool,
+}
+
+impl Default for SteerOpts {
+    fn default() -> Self {
+        Self {
+            gain: 0.0,
+            op: InversionOp::Polarity,
+            mass: None,
+            basin_id: None,
+            basin_locked: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SteerReport {
+    pub memory_id: Uuid,
+    pub gain: f32,
+    pub op: InversionOp,
+    pub mass: f32,
+    pub cosine_before_after: f32,
+    pub collapse_risk: bool,
+    pub basin_id: Option<String>,
+    pub basin_locked: bool,
 }
 
 impl MemoryService {
@@ -193,6 +235,40 @@ impl MemoryService {
         .await
     }
 
+    /// Pick memories for a live steering host, with the knobs to apply them.
+    ///
+    /// Deliberately over-fetches to a depth that does **not** track `limit`: `separation` needs
+    /// candidates below the cut to judge whether the top hit is distinctly right, and a pool that
+    /// grew with `limit` would make confidence a function of how many picks were requested rather
+    /// than of the query. Asking for more memories must not change how confident we are.
+    pub async fn pick(
+        &self,
+        prompt: &str,
+        filters: &RecallFilters,
+        config: &PickConfig,
+    ) -> Result<MemoryPickSet> {
+        let depth = config.limit.max(1).max(crate::pick::CONFIDENCE_POOL);
+        let hits = self.recall(prompt, depth, filters).await?;
+        let hot = self.hot_read().clone();
+        // Second embed of the same prompt. Retrieval computes this vector internally but does not
+        // hand it back, and the null needs it to score the field. Worth ~50ms rather than widening
+        // the retrieval signature — revisit if `pick` ever runs per token.
+        let query_64 = crate::embedding::matryoshka64(&self.embedding.embed(prompt).await?)?;
+        let null = crate::pick::NullModel::estimate(
+            &query_64,
+            &hot.splats,
+            crate::pick::NULL_SAMPLES,
+        );
+        Ok(crate::pick::build(
+            prompt,
+            &hits,
+            &hot,
+            &self.config.embedding.model,
+            null,
+            config,
+        ))
+    }
+
     pub async fn dream(&self) -> Result<DreamReport> {
         let _guard = self.mutation.lock().await;
         let report = {
@@ -329,6 +405,143 @@ impl MemoryService {
 
     pub fn record(&self, id: Uuid) -> Option<MemoryRecord> {
         self.records_read().get(&id).cloned()
+    }
+
+    /// Pack one splat into a 64D memory packet (raw floats + optional Unicode VQ).
+    pub fn pack_packet(&self, id: Uuid, codebook: Option<&VqCodebook>) -> Result<MemoryPacket> {
+        let hot = self.hot_read();
+        let splat = hot
+            .splats
+            .iter()
+            .find(|splat| splat.memory_id == id)
+            .with_context(|| format!("no splat for memory {id}"))?;
+        let mut packet = MemoryPacket::from_semantics(
+            Some(id),
+            &splat.semantics,
+            splat.gain,
+            splat.mass,
+            splat.basin_id.clone(),
+            splat.basin_locked,
+        )?;
+        if let Some(cb) = codebook {
+            packet = packet.with_unicode(cb)?;
+        }
+        Ok(packet)
+    }
+
+    /// Apply a packet onto an existing splat (by packet.memory_id or override id).
+    ///
+    /// Writes 64D semantics into hot + HNSW. Gain/mass/basin from the packet.
+    /// Cold text is never rewritten. Unicode is only used if raw semantics are absent.
+    pub fn unpack_packet(
+        &self,
+        packet: &MemoryPacket,
+        codebook: Option<&VqCodebook>,
+        id_override: Option<Uuid>,
+    ) -> Result<SteerReport> {
+        let id = id_override
+            .or(packet.memory_id)
+            .context("packet has no memory_id and no override")?;
+        let semantics = packet.resolve_semantics(codebook)?;
+        let before;
+        let report = {
+            let mut hot = self.hot_write();
+            let projection = hot.projection.clone();
+            let splat = hot
+                .splats
+                .iter_mut()
+                .find(|splat| splat.memory_id == id)
+                .with_context(|| format!("no splat for memory {id}"))?;
+            before = splat.semantics.clone();
+            splat.semantics = semantics.clone();
+            splat.gain = packet.gain;
+            splat.mass = packet.mass;
+            if let Some(basin_id) = packet.basin_id.clone() {
+                splat.basin_id = Some(basin_id);
+            }
+            splat.basin_locked = packet.basin_locked || splat.basin_locked;
+            if let Some(projection) = &projection {
+                splat.position = projection.apply(&splat.semantics);
+            }
+            SteerReport {
+                memory_id: id,
+                gain: splat.gain,
+                op: InversionOp::Polarity,
+                mass: splat.mass,
+                cosine_before_after: crate::geometry::cosine(&before, &splat.semantics),
+                collapse_risk: collapse_risk(packet.gain),
+                basin_id: splat.basin_id.clone(),
+                basin_locked: splat.basin_locked,
+            }
+        };
+        self.ann.set(id, &semantics)?;
+        self.persist_hot_and_ann()?;
+        Ok(report)
+    }
+
+    /// Steer one splat in the hot field.
+    ///
+    /// - Negative **gain** inverts semantics (OI). Cold text is untouched.
+    /// - Negative **mass** (if provided) makes the splat a repulsive bollard in dream.
+    /// - These knobs do not imply each other.
+    pub async fn steer(&self, id: Uuid, opts: SteerOpts) -> Result<SteerReport> {
+        let _guard = self.mutation.lock().await;
+        let mut hot = self.hot_write();
+        let projection = hot.projection.clone();
+        let splat = hot
+            .splats
+            .iter_mut()
+            .find(|splat| splat.memory_id == id)
+            .with_context(|| format!("no splat for memory {id}"))?;
+
+        let before = splat.semantics.clone();
+        if opts.gain != 0.0 {
+            // Self-axis invert/amplify: the concept direction is the memory itself.
+            let steered =
+                inversion::apply_steering(&before, &before, opts.gain, opts.op)?;
+            splat.semantics = steered;
+            // Record the α that was *applied*, not the one requested: `apply_steering`
+            // clamps into the measured sweet band, so `--gain -0.9` moves the vector by
+            // 0.35. Storing the request would claim a rotation the semantics never took,
+            // and would let values outside the band back into the field that the
+            // legacy-1.0 migration relies on being impossible.
+            splat.gain = inversion::clamp_alpha(opts.gain);
+            if let Some(projection) = &projection {
+                splat.position = projection.apply(&splat.semantics);
+            }
+        }
+        if let Some(mass) = opts.mass {
+            splat.mass = mass;
+        }
+        if let Some(basin_id) = opts.basin_id.clone() {
+            splat.basin_id = Some(basin_id);
+        }
+        if opts.basin_locked {
+            splat.basin_locked = true;
+        }
+
+        let cosine_before_after = crate::geometry::cosine(&before, &splat.semantics);
+        let semantics_for_ann = splat.semantics.clone();
+        let report = SteerReport {
+            memory_id: id,
+            gain: splat.gain,
+            op: opts.op,
+            mass: splat.mass,
+            cosine_before_after,
+            // Deliberately the *requested* gain, not the stored one. Clamping caps the
+            // applied α at 0.35, below the 0.40 collapse onset, so scoring the clamped
+            // value would make this flag permanently false and useless. The caller asked
+            // for something past the band; say so.
+            collapse_risk: collapse_risk(opts.gain),
+            basin_id: splat.basin_id.clone(),
+            basin_locked: splat.basin_locked,
+        };
+        drop(hot);
+        if opts.gain != 0.0 {
+            self.ann.set(id, &semantics_for_ann)?;
+        }
+        self.persist_hot_and_ann()?;
+        Ok(report)
     }
 
     fn persist_hot_and_ann(&self) -> Result<()> {

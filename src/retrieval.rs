@@ -82,7 +82,22 @@ impl RetrievalEngine<'_> {
                 .map(|splat| splat.radiance / (splat.radiance + 1.0))
                 .unwrap_or(0.0);
             let bm25_score = bm25.get(&id).copied().unwrap_or(0.0);
-            let cosine = cosine_scores.get(&id).copied().unwrap_or(0.0);
+            // A candidate found by BM25 alone has no entry here — the ANN never returned it, so its
+            // cosine was never *measured*. Treating that absence as 0.0 is not "orthogonal to the
+            // query", it is a ~7-point penalty at weight_cosine 10.0 against a true value that runs
+            // ~0.7 on this corpus, and it systematically demotes exactly the lexical matches the
+            // hybrid exists to include. Measured live: the top two hits for "what did I eat for
+            // breakfast" both scored cosine 0.0 with bm25 7.4.
+            //
+            // The ANN is an approximate index for *finding* candidates. Once one is in hand the
+            // exact cosine is a 64-d dot product against semantics we already hold, so compute it.
+            let cosine = cosine_scores
+                .get(&id)
+                .copied()
+                .or_else(|| splat.map(|splat| crate::geometry::cosine(&local_query, &splat.semantics)))
+                // Only reachable for a memory with no splat, i.e. one that has never been through a
+                // dream. There genuinely is no vector to compare, so this 0.0 means unknown.
+                .unwrap_or(0.0);
             let final_score = bm25_score * self.config.weight_bm25
                 + cosine * self.config.weight_cosine
                 + radiance * effective_radiance_weight;
