@@ -1,0 +1,24 @@
+pub mod ann;
+pub mod cold_store;
+pub mod config;
+pub mod embedding;
+pub mod eval;
+pub mod geometry;
+pub mod ingest;
+pub mod inversion;
+pub mod lexical;
+pub mod mcp;
+pub mod packet;
+pub mod physics;
+pub mod pick;
+pub mod qdrant;
+pub mod record;
+pub mod retrieval;
+pub mod service;
+pub mod topology;
+pub mod web;
+pub mod wire;
+
+pub use config::AppConfig;
+pub use record::{AttachmentRef, MemoryRecord, RecallContext, RecallHit, ScoreBreakdown};
+pub use service::MemoryService;

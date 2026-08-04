@@ -1,0 +1,6 @@
+{"id":"garden-1","session_id":"garden","role":"user","text":"How should I prepare the garden soil for tomatoes?"}
+{"id":"garden-2","session_id":"garden","role":"assistant","text":"Mix compost into the tomato bed and keep the soil evenly moist."}
+{"id":"garden-3","session_id":"garden","role":"user","text":"Mulch the tomatoes after the soil warms."}
+{"id":"rust-1","session_id":"rust","role":"user","text":"The Rust memory index should use stable UUID keys."}
+{"id":"rust-2","session_id":"rust","role":"assistant","text":"Sort HNSW ties by distance and then by the stable memory key."}
+{"id":"rust-3","session_id":"rust","role":"user","text":"Persist the keyed vector graph beside the append-only cold store."}

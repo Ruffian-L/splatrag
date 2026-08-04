@@ -1,0 +1,47 @@
+{
+  "after_poison": {
+    "k": 10,
+    "ndcg_at_k": 0.7256535198295979,
+    "queries": 300,
+    "recall_at_k": 0.8517777777777776
+  },
+  "baseline": {
+    "k": 10,
+    "ndcg_at_k": 0.7277328619743648,
+    "queries": 300,
+    "recall_at_k": 0.8617777777777776
+  },
+  "cold_preserved_during_dream": true,
+  "complete": true,
+  "contract": {
+    "max_recall_drop": 0.05,
+    "ndcg_at_10_min": 0.75,
+    "recall_at_10_min": 0.88
+  },
+  "corpus_appended": 5183,
+  "corpus_ingest": {
+    "emitted": 5183,
+    "files": 1,
+    "pending": 0,
+    "rejected": 0,
+    "source_items": 5183
+  },
+  "dataset": "datasets/scifact",
+  "dream": {
+    "basins": 51,
+    "kinetic_energy": 999.8335571289062,
+    "persistence_intervals": 7176,
+    "steps": 1200
+  },
+  "note": "full SciFact -> poison -> dream -> SciFact handshake",
+  "passed": false,
+  "poison_appended": 5000,
+  "poison_ingest": {
+    "emitted": 5000,
+    "files": 1,
+    "pending": 0,
+    "rejected": 0,
+    "source_items": 5000
+  },
+  "recall_drop": 0.010000000000000009
+}

@@ -1,0 +1,25 @@
+data_dir = "target/smoke-data"
+scope_key = "splatrag-smoke-v1"
+
+[qdrant]
+url = "http://127.0.0.1:6360"
+collection = "export-conversations"
+enabled = true
+
+[embedding]
+url = "http://127.0.0.1:8081"
+model = "Qwen3-Embedding-8B-Q8_0.gguf"
+dimensions = 4096
+batch_size = 8
+timeout_seconds = 180
+
+[labeling]
+url = "http://127.0.0.1:8082"
+model = "gemma-3-4b-it-q4_0.gguf"
+enabled = true
+timeout_seconds = 180
+
+[physics]
+steps = 40
+basin_radius = 2.5
+min_basin_size = 2

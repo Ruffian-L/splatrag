@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>SplatRAG Memory Field</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header>
+    <div>
+      <p class="eyebrow">LOCAL AI MEMORY</p>
+      <h1>SplatRAG Field</h1>
+    </div>
+    <div id="status">connecting…</div>
+  </header>
+  <main>
+    <section class="viewport">
+      <canvas id="field"></canvas>
+      <div class="controls">
+        <button id="basin-view" class="active">Basins</button>
+        <button id="memory-view">Memory splats</button>
+        <span>drag to orbit · wheel to zoom · click a splat</span>
+      </div>
+    </section>
+    <aside>
+      <form id="search-form">
+        <input id="search" type="search" placeholder="Recall a memory…" autocomplete="off">
+        <button>Recall</button>
+      </form>
+      <div id="detail">
+        <p class="quiet">Select a basin or run a recall.</p>
+      </div>
+      <div id="basins"></div>
+    </aside>
+  </main>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
+

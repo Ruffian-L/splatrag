@@ -1,0 +1,58 @@
+SplatRag Bench REPRO 2026-08-04 — honest dual window
+=====================================================
+Stack: release retrieve + Nomic v1.5 (CPU) + prebuilt scifact.geom/sem/manifest
+Date: 2026-08-04
+Lead: Jason Van Pham · collaborators: Grok / Claude / Codex / Gemini (lineage)
+
+WINDOW A — first 50 SciFact queries with qrels
+(matches historical chart + benchmark_report.txt + HF hybrid floors EXACTLY)
+
+Framework                    | nDCG@10    | Recall@10 
+-------------------------------------------------------
+SplatRag (BM25 Only)         | 0.7694     | 0.9090
+SplatRag (Dense Only)        | 0.6291     | 0.7460
+SplatRag (Hybrid)            | 0.7822     | 0.9090
+SplatRag (Nuclear)           | 0.7708     | 0.9090
+
+WINDOW B — full 300 SciFact queries with qrels (harder slice; same binary)
+
+Framework                    | nDCG@10    | Recall@10 
+-------------------------------------------------------
+Python BM25 (Baseline)       | 0.5734     | 0.6837
+SplatRag (BM25 Only)         | 0.6584     | 0.7859
+SplatRag (Dense Only)        | 0.5352     | 0.6602
+SplatRag (Hybrid)            | 0.6664     | 0.7876
+SplatRag (Nuclear)           | 0.6585     | 0.7859
+
+Findings
+--------
+1. The published hybrid floors (0.7822 nDCG@10 / 0.9090 R@10) are REAL.
+   They reproduce to four decimals on this machine today (window A).
+2. Repo script used NUM_SAMPLES=50. HF post text said n=300.
+   Honest claim: window A is the published table; window B is the full 300.
+3. Pattern is stable on both windows:
+   Hybrid > Nuclear > BM25-only >> Dense-only.
+   Nuclear is over-weighted fusion — not better than hybrid.
+4. Not independent lab certification. Same harness, SciFact retrieval,
+   Nomic v1.5, local. That is enough to stand on for a portfolio if scoped.
+
+Job-safe one-liner
+------------------
+SplatRag hybrid retrieval on SciFact: nDCG@10 0.7822 / R@10 0.9090
+(reproduced 2026-08-04; first-50 qrel slice matching original table).
+Full-300 harder slice: hybrid 0.6664 / 0.7876, still best of ablations.
+
+------------------------------------------------------------
+LIVE s/ HANDSHAKE (2026-08-04) — Qwen3-Embedding-8B, full 300 qrels
+Fresh store: data-handshake-repro-20260804
+SciFact 5183 + Urban poison 5000 + dream 1200 steps
+
+baseline          R@10 0.8618   nDCG@10 0.7277
+after poison+dream R@10 0.8518   nDCG@10 0.7257
+recall_drop       0.0100   (allowance 0.05)  → PASS
+cold_preserved_during_dream: true             → PASS
+absolute floors (Codex 0.88 / 0.75):           → MISS (baseline + after)
+contract "passed": false only because absolute floors;
+poison resistance held.
+
+Full JSON: research_logs/2026-08-04_handshake_repro.json
