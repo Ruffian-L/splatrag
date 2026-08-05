@@ -1,7 +1,12 @@
 use crate::ann::KeyedAnn;
+use crate::basin_score::{
+    basin_aware_final, basin_centroid_affinity, basin_peer_dense_support,
+    local_semantic_neighborhood_boost, local_semantic_neighborhood_sum,
+    peer_support_for_candidate,
+};
 use crate::config::RetrievalConfig;
 use crate::embedding::{EmbeddingClient, matryoshka64};
-use crate::geometry::HotState;
+use crate::geometry::{cosine as geom_cosine, HotState};
 use crate::lexical::LexicalIndex;
 use crate::qdrant::QdrantIndex;
 use crate::record::{MemoryRecord, RecallContext, RecallFilters, RecallHit, ScoreBreakdown};
@@ -58,10 +63,155 @@ impl RetrievalEngine<'_> {
 
         let splats = hot.splat_map();
         let basins = hot.basin_map();
+
+        // Basin expansion: geometry co-members of top dense hits join the pool.
+        if self.config.basin_expand_max_size > 0 {
+            let mut dense_ranked: Vec<(Uuid, f32)> =
+                cosine_scores.iter().map(|(id, s)| (*id, *s)).collect();
+            dense_ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+            let seeds = self.config.basin_expand_seeds.max(1);
+            let mut expanded_basins = HashSet::new();
+            for (id, score) in dense_ranked.into_iter().take(seeds) {
+                let Some(splat) = splats.get(&id) else {
+                    continue;
+                };
+                let Some(basin_id) = splat.basin_id.as_deref() else {
+                    continue;
+                };
+                if !expanded_basins.insert(basin_id.to_string()) {
+                    continue;
+                }
+                let Some(basin) = basins.get(basin_id) else {
+                    continue;
+                };
+                if basin.member_ids.len() > self.config.basin_expand_max_size {
+                    continue;
+                }
+                // Inherited soft cosine so expanded peers are not orthogonal zeros.
+                let inherited = (score * 0.85).max(0.05);
+                for mid in &basin.member_ids {
+                    if candidate_ids.insert(*mid) {
+                        cosine_scores.entry(*mid).or_insert(inherited);
+                    }
+                }
+            }
+        }
+
+        // HNSW graph expansion: neighbors of top dense *and* top BM25 hits
+        // (local cluster walk — pulls both_miss golds that sit next to a hit in ANN).
+        // Expanded nodes get *true* query–semantics cosine (not a fake inherit), so they
+        // can compete in hybrid rank without the global "fill all missing cosines" regression.
+        if self.config.basin_graph_expand > 0 {
+            let seeds = self.config.basin_expand_seeds.max(1);
+            let mut seed_list: Vec<Uuid> = Vec::new();
+            let mut dense_ranked: Vec<(Uuid, f32)> =
+                cosine_scores.iter().map(|(id, s)| (*id, *s)).collect();
+            dense_ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+            for (id, _) in dense_ranked.into_iter().take(seeds) {
+                seed_list.push(id);
+            }
+            let mut bm25_ranked: Vec<(Uuid, f32)> =
+                bm25.iter().map(|(id, s)| (*id, *s)).collect();
+            bm25_ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+            for (id, _) in bm25_ranked.into_iter().take(seeds) {
+                seed_list.push(id);
+            }
+            // Nearest-first graph expand (neighbors_for_key is distance-ordered).
+            // Only *new* candidates get true query–semantics cosine. Filling cosine for
+            // every BM25-only neighbor was measured as a regression (R 0.8518 → 0.842).
+            let mut expanded = HashSet::new();
+            for id in seed_list {
+                let Ok(neighbors) = self.ann.neighbors_for_key(id) else {
+                    continue;
+                };
+                for mid in neighbors
+                    .into_iter()
+                    .take(self.config.basin_graph_expand)
+                {
+                    if candidate_ids.insert(mid) {
+                        expanded.insert(mid);
+                    }
+                }
+            }
+            for mid in expanded {
+                if let Some(splat) = splats.get(&mid) {
+                    let c = geom_cosine(&local_query, &splat.semantics).max(0.0);
+                    cosine_scores
+                        .entry(mid)
+                        .and_modify(|s| *s = s.max(c))
+                        .or_insert(c);
+                }
+            }
+        }
         let mut sorted_cosine = cosine_scores.values().copied().collect::<Vec<_>>();
         sorted_cosine.sort_by(|a, b| b.total_cmp(a));
         let damping = homeostatic_damping(&sorted_cosine);
         let effective_radiance_weight = self.config.weight_radiance * damping;
+
+        // Per-query rank lists for RRF (1-based ranks among candidates that have a score).
+        let bm25_rank = rank_map(&bm25);
+        let cosine_rank = rank_map(&cosine_scores);
+        let bm25_norm = if self.config.normalize_scores {
+            minmax_normalize(&bm25)
+        } else {
+            HashMap::new()
+        };
+        let cosine_norm = if self.config.normalize_scores {
+            minmax_normalize(&cosine_scores)
+        } else {
+            HashMap::new()
+        };
+        let use_rrf = self.config.fusion.eq_ignore_ascii_case("rrf");
+        let rrf_k = self.config.rrf_k.max(1.0);
+
+        // Basin geometry for ranking (membership from hot field; no domain stamps).
+        let id_to_basin: HashMap<Uuid, Option<String>> = splats
+            .iter()
+            .map(|(id, splat)| (*id, splat.basin_id.clone()))
+            .collect();
+        let peer_support = if self.config.weight_basin_peer != 0.0 {
+            basin_peer_dense_support(&cosine_scores, &id_to_basin)
+        } else {
+            HashMap::new()
+        };
+        let id_to_semantics: HashMap<Uuid, Vec<f32>> = if self.config.weight_basin_centroid != 0.0
+        {
+            splats
+                .iter()
+                .map(|(id, splat)| (*id, splat.semantics.clone()))
+                .collect()
+        } else {
+            HashMap::new()
+        };
+        // Cache centroid affinity per basin id for this query.
+        let mut centroid_cache: HashMap<String, f32> = HashMap::new();
+        if self.config.weight_basin_centroid != 0.0 {
+            for basin in hot.basins.iter() {
+                let aff = basin_centroid_affinity(
+                    &local_query,
+                    &basin.member_ids,
+                    &id_to_semantics,
+                );
+                centroid_cache.insert(basin.id.clone(), aff);
+            }
+        }
+
+        // Top dense hits with semantics for local soft-cluster boost.
+        let dense_hits_sem: Vec<(f32, Vec<f32>)> = if self.config.weight_basin_local != 0.0 {
+            let mut ranked: Vec<(Uuid, f32)> =
+                cosine_scores.iter().map(|(id, s)| (*id, *s)).collect();
+            ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+            ranked
+                .into_iter()
+                .take(24)
+                .filter_map(|(id, score)| {
+                    let sem = splats.get(&id)?.semantics.clone();
+                    Some((score, sem))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         let mut hits = Vec::new();
         for id in candidate_ids {
@@ -93,9 +243,63 @@ impl RetrievalEngine<'_> {
             //
             // Leave it. If this is revisited, revisit it with a measurement and not an argument.
             let cosine = cosine_scores.get(&id).copied().unwrap_or(0.0);
-            let final_score = bm25_score * self.config.weight_bm25
-                + cosine * self.config.weight_cosine
-                + radiance * effective_radiance_weight;
+            let base = if use_rrf {
+                let mut s = 0.0;
+                if let Some(r) = bm25_rank.get(&id) {
+                    s += self.config.weight_bm25 / (rrf_k + *r as f32);
+                }
+                if let Some(r) = cosine_rank.get(&id) {
+                    s += self.config.weight_cosine / (rrf_k + *r as f32);
+                }
+                if effective_radiance_weight != 0.0 {
+                    s += radiance * effective_radiance_weight * 0.01;
+                }
+                s
+            } else {
+                let b = if self.config.normalize_scores {
+                    bm25_norm.get(&id).copied().unwrap_or(0.0)
+                } else {
+                    bm25_score
+                };
+                let c = if self.config.normalize_scores {
+                    cosine_norm.get(&id).copied().unwrap_or(0.0)
+                } else {
+                    cosine
+                };
+                b * self.config.weight_bm25
+                    + c * self.config.weight_cosine
+                    + radiance * effective_radiance_weight
+            };
+            let peer = peer_support_for_candidate(basin_id.as_deref(), &peer_support);
+            let cent = basin_id
+                .as_deref()
+                .and_then(|b| centroid_cache.get(b).copied())
+                .unwrap_or(0.0);
+            let mut final_score = basin_aware_final(
+                base,
+                peer,
+                cent,
+                self.config.weight_basin_peer,
+                self.config.weight_basin_centroid,
+            );
+            if self.config.weight_basin_local != 0.0 {
+                if let Some(splat) = splat {
+                    let local = if self.config.basin_local_sum {
+                        local_semantic_neighborhood_sum(
+                            &splat.semantics,
+                            &dense_hits_sem,
+                            self.config.basin_local_threshold,
+                        )
+                    } else {
+                        local_semantic_neighborhood_boost(
+                            &splat.semantics,
+                            &dense_hits_sem,
+                            self.config.basin_local_threshold,
+                        )
+                    };
+                    final_score += self.config.weight_basin_local * local;
+                }
+            }
             let basin_label = basin_id
                 .as_deref()
                 .and_then(|id| basins.get(id))
@@ -123,6 +327,33 @@ impl RetrievalEngine<'_> {
         hits.truncate(limit);
         Ok(hits)
     }
+}
+
+fn rank_map(scores: &HashMap<Uuid, f32>) -> HashMap<Uuid, usize> {
+    let mut items: Vec<(Uuid, f32)> = scores.iter().map(|(id, s)| (*id, *s)).collect();
+    items.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    items
+        .into_iter()
+        .enumerate()
+        .map(|(i, (id, _))| (id, i + 1))
+        .collect()
+}
+
+fn minmax_normalize(scores: &HashMap<Uuid, f32>) -> HashMap<Uuid, f32> {
+    if scores.is_empty() {
+        return HashMap::new();
+    }
+    let mut min = f32::INFINITY;
+    let mut max = f32::NEG_INFINITY;
+    for v in scores.values() {
+        min = min.min(*v);
+        max = max.max(*v);
+    }
+    let span = (max - min).max(1e-9);
+    scores
+        .iter()
+        .map(|(id, v)| (*id, (v - min) / span))
+        .collect()
 }
 
 pub fn homeostatic_damping(cosine_scores: &[f32]) -> f32 {

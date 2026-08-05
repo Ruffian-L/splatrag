@@ -91,9 +91,21 @@ impl EmbeddingClient {
             })
             .send()
             .await
-            .context("failed to reach local embedding server")?
-            .error_for_status()
-            .context("local embedding server rejected request")?
+            .context("failed to reach local embedding server")?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            let preview: String = texts
+                .iter()
+                .map(|t| format!("{}ch", t.len()))
+                .collect::<Vec<_>>()
+                .join(",");
+            anyhow::bail!(
+                "local embedding server rejected request ({status}); batch_sizes=[{preview}]; body={}",
+                body.chars().take(300).collect::<String>()
+            );
+        }
+        let response = response
             .json::<EmbeddingResponse>()
             .await
             .context("invalid local embedding response")?;
@@ -314,15 +326,16 @@ fn parse_label_json(content: &str) -> Result<BasinLabelDraft> {
 /// embedding is derived state, and a mean-pooled vector over 40k tokens of log spew would not have
 /// carried meaning anyway. Roughly 4 chars per token, so this sits near 25k tokens — comfortably
 /// inside the context with room for whatever the server adds.
-const EMBED_CHAR_BUDGET: usize = 100_000;
+// Per-text cap. Dense code/logs tokenize far denser than ~4 chars/token; 24k chars ≈ room under
+// common 8k–32k contexts after special tokens. Cold log still keeps full text.
+const EMBED_CHAR_BUDGET: usize = 24_000;
 
 /// Characters allowed in a single request, summed across its inputs.
 ///
 /// llama-server charges one request for the total of everything in it, so a batch of long memories
-/// overflows the context even when each memory fits on its own. At roughly 4 chars per token this
-/// is ~30k tokens, leaving headroom under a 40,960 context. Requests are split to fit; a single
-/// text over budget still goes alone rather than being dropped.
-const REQUEST_CHAR_BUDGET: usize = 120_000;
+/// overflows the context even when each memory fits on its own. Keep total request budget tight so
+/// a 32-wide batch of medium dumps cannot 400 the whole Grok/Gemini ingest.
+const REQUEST_CHAR_BUDGET: usize = 48_000;
 
 /// Clip to [`EMBED_CHAR_BUDGET`] on a char boundary. Cheap no-op for the overwhelming majority.
 fn bound_for_embedding(text: &str) -> String {

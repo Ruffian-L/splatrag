@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use splatrag::eval::{MAX_RECALL_DROP, evaluate_scifact};
+use splatrag::eval::{
+    MAX_RECALL_DROP, classify_scifact_misses, evaluate_scifact, flip_query,
+};
 use splatrag::ingest::{IngestReport, Ingestor, SourceKind};
 use splatrag::record::{MemoryRecord, RecallFilters};
 use splatrag::{AppConfig, MemoryService};
@@ -174,6 +176,29 @@ enum Command {
     Mcp,
     Serve,
     RebuildIndex,
+    /// BM25 vs dense vs rank miss taxonomy on SciFact (or free-text --query flip).
+    MissClassify {
+        #[arg(long, default_value = "datasets/scifact")]
+        dataset: PathBuf,
+        #[arg(long, default_value_t = 10)]
+        k: usize,
+        /// Candidate depth per arm (pool for miss detection).
+        #[arg(long, default_value_t = 80)]
+        cand: usize,
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Free-text flip only (no full qrels walk).
+        #[arg(long)]
+        query: Option<String>,
+        /// Optional gold doc ids for free-text flip (comma-separated).
+        #[arg(long)]
+        gold: Option<String>,
+        #[arg(long)]
+        domain: Option<String>,
+        /// Write full JSON report (default: stdout summary + path).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     Handshake {
         #[arg(long, default_value = "datasets/scifact")]
         dataset: PathBuf,
@@ -454,6 +479,58 @@ async fn main() -> Result<()> {
         Command::RebuildIndex => {
             rebuild_indices(config).await?;
         }
+        Command::MissClassify {
+            dataset,
+            k,
+            cand,
+            limit,
+            query,
+            gold,
+            domain,
+            out,
+        } => {
+            let service = MemoryService::open(config)?;
+            if let Some(q) = query {
+                let golds: Vec<(String, u32)> = gold
+                    .as_deref()
+                    .unwrap_or("")
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| (s.to_string(), 1u32))
+                    .collect();
+                let report =
+                    flip_query(&service, &q, k, cand, &golds, domain.as_deref()).await?;
+                let text = serde_json::to_string_pretty(&report)?;
+                if let Some(path) = out {
+                    std::fs::write(&path, &text)
+                        .with_context(|| format!("write {}", path.display()))?;
+                    eprintln!("wrote {}", path.display());
+                }
+                println!("{text}");
+            } else {
+                let report =
+                    classify_scifact_misses(&service, &dataset, k, cand, limit).await?;
+                let summary = serde_json::json!({
+                    "queries": report.queries,
+                    "failing_queries": report.failing_queries,
+                    "k": report.k,
+                    "candidate_limit": report.candidate_limit,
+                    "gold_counts": report.gold_counts,
+                    "query_primary_counts": report.query_primary_counts,
+                });
+                eprintln!("{}", serde_json::to_string_pretty(&summary)?);
+                let text = serde_json::to_string_pretty(&report)?;
+                if let Some(path) = out {
+                    std::fs::write(&path, &text)
+                        .with_context(|| format!("write {}", path.display()))?;
+                    eprintln!("full report → {}", path.display());
+                } else {
+                    // stdout only summary unless --out (full can be huge)
+                    println!("{}", serde_json::to_string_pretty(&summary)?);
+                }
+            }
+        }
         Command::Handshake {
             dataset,
             poison,
@@ -468,7 +545,7 @@ async fn main() -> Result<()> {
 }
 
 /// Default niodv4 juice codebook (256 × 64, PUA transport). Override with --codebook.
-const DEFAULT_CODEBOOK: &str = "/media/ruffianl/backup_sandisk/02_projects/niodoo_team_build_code_backup_20260608-150015/worktree/niodv4/experiments/encode_decode/niodv4/results/codebook_256.json";
+const DEFAULT_CODEBOOK: &str = "";
 
 fn load_codebook(
     path: Option<PathBuf>,

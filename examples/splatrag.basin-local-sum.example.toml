@@ -1,0 +1,26 @@
+# Basin soft-neighborhood scoring (geometry clump, not domain stamps).
+# Measured SciFact full-300 k=10 (Qwen3-Embedding-8B) — see research_logs for freeze row.
+#
+# weight_basin_local = 0.3
+# basin_local_threshold = 0.50
+# basin_local_sum = true
+#
+# Copy into your config and point data_dir at YOUR store.
+
+[retrieval]
+weight_cosine = 10.0
+weight_bm25 = 1.0
+weight_radiance = 5.0
+candidate_multiplier = 8
+hnsw_max_nodes = 1000000
+hnsw_m = 16
+hnsw_ef_construction = 200
+hnsw_ef_search = 80
+weight_basin_peer = 0.0
+weight_basin_centroid = 0.0
+basin_expand_max_size = 0
+basin_expand_seeds = 8
+weight_basin_local = 0.3
+basin_local_threshold = 0.50
+basin_local_sum = true
+basin_graph_expand = 0

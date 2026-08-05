@@ -4,12 +4,13 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>SplatRAG Memory Field</title>
-  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/style.css?v=20260805-jlens1">
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 </head>
 <body>
   <header>
     <div>
-      <p class="eyebrow">LOCAL AI MEMORY</p>
+      <p class="eyebrow">LOCAL AI MEMORY · mixed-control</p>
       <h1>SplatRAG Field</h1>
     </div>
     <div id="status">connecting…</div>
@@ -28,13 +29,21 @@
         <input id="search" type="search" placeholder="Recall a memory…" autocomplete="off">
         <button>Recall</button>
       </form>
+      <section id="jlens-panel" class="jlens-panel" aria-live="polite">
+        <p class="eyebrow">JLENS · FIRST THOUGHT (not SplatLens)</p>
+        <p class="meta jlens-help">When something is <em>read</em>, first generated-thought words from the model's own vocab map. Separate door from hybrid recall / the field.</p>
+        <p id="jlens-bridge" class="jlens-bridge quiet">paste text below · First thought loads Gemma (CPU, ~1 min first call)</p>
+        <div id="jlens-words" class="jlens-words"></div>
+        <p id="jlens-meta" class="meta"></p>
+        <button type="button" id="jlens-btn" class="jlens-run">First thought on search box</button>
+      </section>
       <div id="detail">
         <p class="quiet">Select a basin or run a recall.</p>
       </div>
       <div id="basins"></div>
     </aside>
   </main>
-  <script type="module" src="/app.js"></script>
+  <script type="module" src="/app.js?v=20260805-jlens1"></script>
 </body>
 </html>
 

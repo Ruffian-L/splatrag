@@ -55,6 +55,58 @@ pub struct RetrievalConfig {
     pub hnsw_m: usize,
     pub hnsw_ef_construction: usize,
     pub hnsw_ef_search: usize,
+    /// `linear` (default) or `rrf` (reciprocal rank fusion). RRF ignores raw score scale.
+    #[serde(default = "default_fusion")]
+    pub fusion: String,
+    /// RRF constant k (classic = 60). Only used when fusion = "rrf".
+    #[serde(default = "default_rrf_k")]
+    pub rrf_k: f32,
+    /// Min-max normalize BM25 and cosine over the candidate set before linear fusion.
+    #[serde(default)]
+    pub normalize_scores: bool,
+    /// Boost: max dense cosine among peers in the same basin (geometry co-membership).
+    #[serde(default)]
+    pub weight_basin_peer: f32,
+    /// Boost: cosine(query 64d, basin member-mean semantics).
+    #[serde(default)]
+    pub weight_basin_centroid: f32,
+    /// Pull additional members from basins of top dense hits into the candidate pool
+    /// when basin size ≤ this (avoids mega-basin explosion). 0 = disabled.
+    #[serde(default)]
+    pub basin_expand_max_size: usize,
+    /// How many top dense hits seed basin expansion.
+    #[serde(default = "default_basin_expand_seeds")]
+    pub basin_expand_seeds: usize,
+    /// Boost: local semantic neighborhood of dense hits (soft cluster).
+    #[serde(default)]
+    pub weight_basin_local: f32,
+    /// Cosine threshold for local neighborhood membership.
+    #[serde(default = "default_basin_local_threshold")]
+    pub basin_local_threshold: f32,
+    /// Expand candidate pool with HNSW neighbors of top dense hits (geometry graph).
+    /// 0 = off. Typical 8–16.
+    #[serde(default)]
+    pub basin_graph_expand: usize,
+    /// If true, local neighborhood uses sum of nearby dense scores (clump center);
+    /// if false (default), uses max only.
+    #[serde(default)]
+    pub basin_local_sum: bool,
+}
+
+fn default_basin_local_threshold() -> f32 {
+    0.55
+}
+
+fn default_basin_expand_seeds() -> usize {
+    8
+}
+
+fn default_fusion() -> String {
+    "linear".into()
+}
+
+fn default_rrf_k() -> f32 {
+    60.0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -143,6 +195,17 @@ impl Default for RetrievalConfig {
             hnsw_m: 16,
             hnsw_ef_construction: 200,
             hnsw_ef_search: 80,
+            fusion: default_fusion(),
+            rrf_k: default_rrf_k(),
+            normalize_scores: false,
+            weight_basin_peer: 0.0,
+            weight_basin_centroid: 0.0,
+            basin_expand_max_size: 0,
+            basin_expand_seeds: default_basin_expand_seeds(),
+            weight_basin_local: 0.0,
+            basin_local_threshold: default_basin_local_threshold(),
+            basin_graph_expand: 0,
+            basin_local_sum: false,
         }
     }
 }
@@ -188,15 +251,71 @@ impl Default for ServerConfig {
     }
 }
 
+/// Refuse all-interfaces / unspecified binds. Loopback only (`127.0.0.1`, `localhost`, `::1`).
+pub fn assert_loopback_bind(bind: &str, field: &str) -> Result<()> {
+    let bind = bind.trim();
+    let host = if let Some(rest) = bind.strip_prefix('[') {
+        // [IPv6]:port
+        rest.split(']')
+            .next()
+            .unwrap_or(rest)
+            .trim()
+            .to_ascii_lowercase()
+    } else if bind.matches(':').count() == 1 {
+        // host:port
+        bind.rsplit_once(':')
+            .map(|(h, _)| h.trim().to_ascii_lowercase())
+            .unwrap_or_else(|| bind.to_ascii_lowercase())
+    } else {
+        // bare host or weird form — treat whole string
+        bind.to_ascii_lowercase()
+    };
+
+    let forbidden = matches!(
+        host.as_str(),
+        "0.0.0.0" | "::" | "[::]" | "*" | "" | "0" | "[::0]" | "::0"
+    ) || host.starts_with("0.0.0.0")
+        || host == "[::]"
+        || host == "::0";
+
+    if forbidden {
+        anyhow::bail!(
+            "{field}={bind:?} is not allowed: bind must be loopback only \
+             (use 127.0.0.1:PORT or [::1]:PORT). All-interfaces binds (0.0.0.0 / ::) are rejected."
+        );
+    }
+
+    let ok = host == "127.0.0.1"
+        || host == "localhost"
+        || host == "::1"
+        || host == "[::1]";
+    if !ok {
+        anyhow::bail!(
+            "{field}={bind:?} is not loopback. Allowed hosts: 127.0.0.1, localhost, ::1. \
+             Refusing to open a non-local socket."
+        );
+    }
+    Ok(())
+}
+
 impl AppConfig {
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        if !path.exists() {
-            return Ok(Self::default());
-        }
-        let text = fs::read_to_string(path)
-            .with_context(|| format!("failed to read config {}", path.display()))?;
-        toml::from_str(&text).with_context(|| format!("invalid config {}", path.display()))
+        let config = if !path.exists() {
+            Self::default()
+        } else {
+            let text = fs::read_to_string(path)
+                .with_context(|| format!("failed to read config {}", path.display()))?;
+            toml::from_str(&text).with_context(|| format!("invalid config {}", path.display()))?
+        };
+        config.validate_localhost_only()?;
+        Ok(config)
+    }
+
+    /// HTTP / service bind must be loopback only. Never `0.0.0.0`, `::`, or `*`.
+    pub fn validate_localhost_only(&self) -> Result<()> {
+        assert_loopback_bind(&self.server.bind, "server.bind")?;
+        Ok(())
     }
 
     pub fn write_default(path: impl AsRef<Path>) -> Result<()> {

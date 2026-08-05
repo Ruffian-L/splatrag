@@ -1,4 +1,5 @@
 pub mod ann;
+pub mod basin_score;
 pub mod cold_store;
 pub mod config;
 pub mod embedding;
@@ -6,6 +7,7 @@ pub mod eval;
 pub mod geometry;
 pub mod ingest;
 pub mod inversion;
+pub mod jlens;
 pub mod lexical;
 pub mod mcp;
 pub mod packet;

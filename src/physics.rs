@@ -28,6 +28,22 @@ pub struct DreamReport {
 }
 
 pub fn dream(state: &mut HotState, ann: &KeyedAnn, config: &PhysicsConfig) -> Result<DreamReport> {
+    dream_with_progress(state, ann, config, 0, |_, _, _| {})
+}
+
+/// Same physics as [`dream`], but calls `on_step(step, kinetic_energy, state)` every `emit_every`
+/// completed steps (and once on the final step). `emit_every == 0` disables mid-run hooks
+/// (final hook still fires).
+pub fn dream_with_progress<F>(
+    state: &mut HotState,
+    ann: &KeyedAnn,
+    config: &PhysicsConfig,
+    emit_every: usize,
+    mut on_step: F,
+) -> Result<DreamReport>
+where
+    F: FnMut(usize, f32, &HotState),
+{
     if state.splats.is_empty() {
         return Ok(DreamReport {
             steps: 0,
@@ -63,6 +79,8 @@ pub fn dream(state: &mut HotState, ann: &KeyedAnn, config: &PhysicsConfig) -> Re
         // Negative mass → repels. Negative gain is not consulted here (that inverts
         // semantics at steer time, already baked into splat.semantics).
         splat.mass = mass_from_radiance(splat.mass, splat.radiance);
+        // Domain/state colors so the live field is readable (SciFact vs Urban, basin tint).
+        splat.color_rgba = domain_state_color(&splat.domain, splat.basin_id.as_deref(), 0.0);
     }
 
     let mut energy = f32::INFINITY;
@@ -154,6 +172,15 @@ pub fn dream(state: &mut HotState, ann: &KeyedAnn, config: &PhysicsConfig) -> Re
             energy += 0.5 * inertia * length(splat.velocity).powi(2);
         }
         steps_taken += 1;
+        // Speed-tint: faster stars glow hotter so motion is visible in the live feed.
+        if emit_every > 0 && steps_taken % emit_every == 0 {
+            for splat in &mut state.splats {
+                let speed = length(splat.velocity);
+                splat.color_rgba =
+                    domain_state_color(&splat.domain, splat.basin_id.as_deref(), speed);
+            }
+            on_step(steps_taken, energy, state);
+        }
         // Settle on total movement rather than a fixed step count: a field still collapsing keeps
         // running, and one that has already found its shape stops instead of burning the budget.
         // The threshold scales with the corpus so it means "per splat", not "in total".
@@ -165,15 +192,69 @@ pub fn dream(state: &mut HotState, ann: &KeyedAnn, config: &PhysicsConfig) -> Re
     let previous = state.basins.clone();
     let (basins, persistence_intervals) = discover_basins(&mut state.splats, &previous, config);
     state.basins = basins;
+    // Re-tint after basin assignment so basin hue lands on settled membership.
+    for splat in &mut state.splats {
+        splat.color_rgba = domain_state_color(&splat.domain, splat.basin_id.as_deref(), 0.0);
+    }
     state.dream_cycle += 1;
     state.last_dream_at = Some(Utc::now());
     state.kinetic_energy = energy;
+    on_step(steps_taken, energy, state);
     Ok(DreamReport {
         steps: steps_taken,
         kinetic_energy: energy,
         basins: state.basins.len(),
         persistence_intervals,
     })
+}
+
+/// Domain = primary hue family. Basin id = within-family tint. Speed = live brightness.
+/// SciFact → cool cyan/blue. Urban (poison) → warm amber/magenta. Other → violet.
+pub fn domain_state_color(domain: &str, basin_id: Option<&str>, speed: f32) -> [u8; 4] {
+    let d = domain.to_ascii_lowercase();
+    let (base_h, sat) = if d.contains("scifact") || d == "science" {
+        (205.0, 0.72)
+    } else if d.contains("urban") || d.contains("poison") || d.contains("junk") {
+        (28.0, 0.82)
+    } else if d.contains("chat") || d.contains("agent") {
+        (275.0, 0.55)
+    } else {
+        (160.0, 0.45)
+    };
+    let basin_jitter = basin_id
+        .map(|id| {
+            let mut h = 0u32;
+            for b in id.bytes() {
+                h = h.wrapping_mul(31).wrapping_add(b as u32);
+            }
+            (h % 40) as f32 - 20.0
+        })
+        .unwrap_or(0.0);
+    let hue = (base_h + basin_jitter).rem_euclid(360.0);
+    let speed_boost = (speed * 8.0).clamp(0.0, 0.45);
+    let value = (0.55 + speed_boost).clamp(0.35, 1.0);
+    let alpha = (200.0 + speed_boost * 55.0).clamp(160.0, 255.0) as u8;
+    let (r, g, b) = hsv_to_rgb(hue, sat, value);
+    [r, g, b, alpha]
+}
+
+fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
+    let c = v * s;
+    let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
+    let m = v - c;
+    let (rp, gp, bp) = match h as i32 {
+        0..=59 => (c, x, 0.0),
+        60..=119 => (x, c, 0.0),
+        120..=179 => (0.0, c, x),
+        180..=239 => (0.0, x, c),
+        240..=299 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    (
+        ((rp + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+        ((gp + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+        ((bp + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+    )
 }
 
 fn subtract(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {

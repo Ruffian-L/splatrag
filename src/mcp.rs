@@ -196,7 +196,7 @@ async fn call_tool(params: Value, service: &MemoryService) -> Result<Value, (i32
                     .get("codebook")
                     .and_then(Value::as_str)
                     .unwrap_or(
-                        "/media/ruffianl/backup_sandisk/02_projects/niodoo_team_build_code_backup_20260608-150015/worktree/niodv4/experiments/encode_decode/niodv4/results/codebook_256.json",
+                        "",
                     );
                 Some(
                     crate::packet::VqCodebook::load_json(path).map_err(internal_error)?,
@@ -230,7 +230,7 @@ async fn call_tool(params: Value, service: &MemoryService) -> Result<Value, (i32
                     .get("codebook")
                     .and_then(Value::as_str)
                     .unwrap_or(
-                        "/media/ruffianl/backup_sandisk/02_projects/niodoo_team_build_code_backup_20260608-150015/worktree/niodv4/experiments/encode_decode/niodv4/results/codebook_256.json",
+                        "",
                     );
                 Some(
                     crate::packet::VqCodebook::load_json(path).map_err(internal_error)?,

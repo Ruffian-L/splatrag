@@ -1,15 +1,21 @@
 use crate::inversion::InversionOp;
 use crate::packet::{MemoryPacket, VqCodebook};
+use crate::physics::domain_state_color;
 use crate::record::RecallFilters;
 use crate::service::{MemoryService, MemoryStatus, SteerOpts, SteerReport};
 use crate::wire::{WireBasin, WireMemoryRecord, WireRecallHit};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio_stream::StreamExt as _;
+use tokio_stream::wrappers::BroadcastStream;
 use tower_http::cors::CorsLayer;
 use uuid::Uuid;
 
@@ -94,7 +100,7 @@ fn open_codebook(path: Option<&str>, want: bool) -> Result<Option<VqCodebook>, A
         return Ok(None);
     }
     let path = path.unwrap_or(
-        "/media/ruffianl/backup_sandisk/02_projects/niodoo_team_build_code_backup_20260608-150015/worktree/niodv4/experiments/encode_decode/niodv4/results/codebook_256.json",
+        "",
     );
     Ok(Some(VqCodebook::load_json(path)?))
 }
@@ -121,7 +127,19 @@ struct SplatPage {
 }
 
 pub async fn serve(service: Arc<MemoryService>) -> anyhow::Result<()> {
+    // Hard gate: never listen on 0.0.0.0 / :: even if config was hand-edited after load.
+    crate::config::assert_loopback_bind(&service.config.server.bind, "server.bind")?;
     let bind = service.config.server.bind.clone();
+    if let Ok(path) = std::env::var("SPLATRAG_LIVE_LOG") {
+        if !path.is_empty() {
+            service.set_live_log_path(Some(std::path::PathBuf::from(&path)));
+            eprintln!("live frame log → {path}");
+        }
+    }
+    // Domain colors on first paint so the field is readable without a dream.
+    if let Err(err) = service.recolor_field() {
+        eprintln!("recolor_field: {err:#}");
+    }
     let app = Router::new()
         .route("/", get(index))
         .route("/app.js", get(javascript))
@@ -135,10 +153,21 @@ pub async fn serve(service: Arc<MemoryService>) -> anyhow::Result<()> {
         .route("/api/steer", post(steer))
         .route("/api/packet/:id", get(get_packet))
         .route("/api/packet", post(post_packet))
+        .route("/api/live", get(live_sse))
+        .route("/api/dream", post(start_dream))
+        .route("/api/recolor", post(recolor))
+        .route("/api/flip", get(flip_get).post(flip_post))
+        .route("/api/miss-classify", post(miss_classify_post))
+        .route("/api/jlens", get(jlens_get).post(jlens_post))
         .layer(CorsLayer::permissive())
         .with_state(service);
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     eprintln!("SplatLens listening on http://{bind}");
+    eprintln!("  live SSE  GET  /api/live");
+    eprintln!("  dream     POST /api/dream  body: {{\"emit_every\":5}}");
+    eprintln!("  flip      GET|POST /api/flip?q=…");
+    eprintln!("  jlens     GET|POST /api/jlens?q=…  (verbalizable words)");
+    eprintln!("  misses    POST /api/miss-classify");
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -195,19 +224,36 @@ async fn splats(
         snapshot
             .basins
             .iter()
-            .map(|basin| ViewerSplat {
-                id: basin.id.clone(),
-                position: basin.centroid,
-                scale: {
-                    let radius = 1.0 + (basin.member_ids.len() as f32 + 1.0).ln() * 0.25;
-                    [radius, radius * 0.55, radius * 0.55]
-                },
-                rotation: [0.0, 0.0, 0.0, 1.0],
-                color: [80, 180, 255, 230],
-                radiance: basin.stability,
-                mass: basin.member_ids.len() as f32,
-                basin_id: Some(basin.id.clone()),
-                label: Some(basin.label.clone()),
+            .map(|basin| {
+                // Use majority *actual* domain string — do not invent scifact/urban when
+                // the store is mixed-control (all domain="mixed").
+                let mut counts: std::collections::HashMap<String, usize> =
+                    std::collections::HashMap::new();
+                for id in &basin.member_ids {
+                    if let Some(s) = snapshot.splats.iter().find(|s| s.memory_id == *id) {
+                        let d = s.domain.to_ascii_lowercase();
+                        *counts.entry(d).or_default() += 1;
+                    }
+                }
+                let domain = counts
+                    .into_iter()
+                    .max_by_key(|(_, n)| *n)
+                    .map(|(d, _)| d)
+                    .unwrap_or_else(|| "mixed".into());
+                ViewerSplat {
+                    id: basin.id.clone(),
+                    position: basin.centroid,
+                    scale: {
+                        let radius = 1.0 + (basin.member_ids.len() as f32 + 1.0).ln() * 0.25;
+                        [radius, radius * 0.55, radius * 0.55]
+                    },
+                    rotation: [0.0, 0.0, 0.0, 1.0],
+                    color: domain_state_color(&domain, Some(basin.id.as_str()), 0.0),
+                    radiance: basin.stability.max(0.2),
+                    mass: basin.member_ids.len() as f32,
+                    basin_id: Some(basin.id.clone()),
+                    label: Some(basin.label.clone()),
+                }
             })
             .collect::<Vec<_>>()
     } else {
@@ -225,7 +271,11 @@ async fn splats(
                 position: splat.position,
                 scale: splat.scale,
                 rotation: splat.rotation,
-                color: splat.color_rgba,
+                color: domain_state_color(
+                    &splat.domain,
+                    splat.basin_id.as_deref(),
+                    0.0,
+                ),
                 radiance: splat.radiance,
                 mass: splat.mass,
                 basin_id: splat.basin_id.clone(),
@@ -320,4 +370,229 @@ async fn post_packet(
         cb.as_ref(),
         override_id,
     )?))
+}
+
+#[derive(Debug, Deserialize)]
+struct DreamBody {
+    emit_every: Option<usize>,
+}
+
+async fn start_dream(
+    State(service): State<Arc<MemoryService>>,
+    body: Option<Json<DreamBody>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let emit_every = body
+        .and_then(|Json(b)| b.emit_every)
+        .unwrap_or(5)
+        .max(1);
+    if service.is_dreaming() {
+        return Ok(Json(serde_json::json!({
+            "ok": false,
+            "error": "dream already running"
+        })));
+    }
+    let svc = service.clone();
+    tokio::spawn(async move {
+        match svc.dream_live(emit_every).await {
+            Ok(report) => eprintln!(
+                "live dream finished steps={} ke={:.4} basins={}",
+                report.steps, report.kinetic_energy, report.basins
+            ),
+            Err(err) => eprintln!("live dream failed: {err:#}"),
+        }
+    });
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "emit_every": emit_every,
+        "note": "subscribe GET /api/live for frames"
+    })))
+}
+
+async fn recolor(
+    State(service): State<Arc<MemoryService>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    service.recolor_field()?;
+    Ok(Json(serde_json::json!({"ok": true})))
+}
+
+#[derive(Debug, Deserialize)]
+struct FlipQuery {
+    q: String,
+    k: Option<usize>,
+    cand: Option<usize>,
+    /// comma-separated gold doc ids
+    gold: Option<String>,
+    domain: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FlipBody {
+    q: String,
+    k: Option<usize>,
+    cand: Option<usize>,
+    gold: Option<Vec<String>>,
+    domain: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MissClassifyBody {
+    dataset: String,
+    k: Option<usize>,
+    cand: Option<usize>,
+    limit: Option<usize>,
+    /// If true, include per-query rows (large). Default false → summary only.
+    #[serde(default)]
+    full: bool,
+}
+
+async fn flip_get(
+    State(service): State<Arc<MemoryService>>,
+    Query(query): Query<FlipQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let golds: Vec<(String, u32)> = query
+        .gold
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| (s.to_string(), 1u32))
+        .collect();
+    let report = crate::eval::flip_query(
+        &service,
+        &query.q,
+        query.k.unwrap_or(10),
+        query.cand.unwrap_or(80),
+        &golds,
+        query.domain.as_deref(),
+    )
+    .await?;
+    Ok(Json(serde_json::to_value(report)?))
+}
+
+async fn flip_post(
+    State(service): State<Arc<MemoryService>>,
+    Json(body): Json<FlipBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let golds: Vec<(String, u32)> = body
+        .gold
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| (s, 1u32))
+        .collect();
+    let report = crate::eval::flip_query(
+        &service,
+        &body.q,
+        body.k.unwrap_or(10),
+        body.cand.unwrap_or(80),
+        &golds,
+        body.domain.as_deref(),
+    )
+    .await?;
+    Ok(Json(serde_json::to_value(report)?))
+}
+
+#[derive(Debug, Deserialize)]
+struct JlensQuery {
+    q: String,
+    top_k: Option<usize>,
+    #[serde(default)]
+    verify: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct JlensBody {
+    q: String,
+    top_k: Option<usize>,
+    #[serde(default)]
+    verify: bool,
+}
+
+async fn jlens_get(
+    Query(query): Query<JlensQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let top_k = query.top_k.unwrap_or(8);
+    let report = crate::jlens::readout_verbalizable(&query.q, top_k, query.verify).await?;
+    Ok(Json(serde_json::to_value(report)?))
+}
+
+async fn jlens_post(
+    Json(body): Json<JlensBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let top_k = body.top_k.unwrap_or(8);
+    let report = crate::jlens::readout_verbalizable(&body.q, top_k, body.verify).await?;
+    Ok(Json(serde_json::to_value(report)?))
+}
+
+async fn miss_classify_post(
+    State(service): State<Arc<MemoryService>>,
+    Json(body): Json<MissClassifyBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let report = crate::eval::classify_scifact_misses(
+        &service,
+        std::path::Path::new(&body.dataset),
+        body.k.unwrap_or(10),
+        body.cand.unwrap_or(80),
+        body.limit,
+    )
+    .await?;
+    if body.full {
+        Ok(Json(serde_json::to_value(report)?))
+    } else {
+        Ok(Json(serde_json::json!({
+            "queries": report.queries,
+            "failing_queries": report.failing_queries,
+            "k": report.k,
+            "candidate_limit": report.candidate_limit,
+            "gold_counts": report.gold_counts,
+            "query_primary_counts": report.query_primary_counts,
+            "sample_failing": report.rows.iter()
+                .filter(|r| r.recall_at_k < 1.0)
+                .take(20)
+                .map(|r| serde_json::json!({
+                    "query_id": r.query_id,
+                    "query_text": r.query_text.chars().take(160).collect::<String>(),
+                    "recall_at_k": r.recall_at_k,
+                    "primary_class": r.primary_class,
+                    "golds": r.golds.iter().map(|g| serde_json::json!({
+                        "doc_id": g.doc_id,
+                        "class": g.class,
+                        "in_bm25": g.in_bm25,
+                        "in_dense": g.in_dense,
+                        "hybrid_rank": g.hybrid_rank,
+                    })).collect::<Vec<_>>(),
+                }))
+                .collect::<Vec<_>>(),
+        })))
+    }
+}
+
+async fn live_sse(
+    State(service): State<Arc<MemoryService>>,
+) -> Sse<impl futures_core::stream::Stream<Item = Result<Event, Infallible>>> {
+    let seed = service.current_live_frame();
+    let rx = service.subscribe_live();
+    let stream = async_stream::stream! {
+        if let Ok(data) = serde_json::to_string(&seed) {
+            yield Ok::<_, Infallible>(Event::default().event("frame").data(data));
+        }
+        let mut stream = BroadcastStream::new(rx);
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(frame) => {
+                    if let Ok(data) = serde_json::to_string(&frame) {
+                        yield Ok(Event::default().event("frame").data(data));
+                    }
+                }
+                Err(_) => {
+                    // lag — drop and continue
+                }
+            }
+        }
+    };
+    Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(2))
+            .text("ping"),
+    )
 }

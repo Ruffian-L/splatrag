@@ -99,21 +99,27 @@ impl KeyedAnn {
         Ok(hits)
     }
 
+    /// Nearest ANN keys to `id`, ordered by distance ascending (nearest first).
+    /// Callers that `take(n)` must see geometry order — UUID sort was measured as wrong.
     pub fn neighbors_for_key(&self, id: Uuid) -> Result<Vec<Uuid>> {
         let index = self.index_read();
         let Some(internal_id) = self.keys_read().get(&id).copied() else {
             return Ok(Vec::new());
         };
         let embedding = index.get_embedding(internal_id);
-        let mut keys = index
-            .search(embedding, 33, self.ef_search.max(33))
+        let mut hits = index
+            .search(embedding, 65, self.ef_search.max(65))
             .into_iter()
-            .filter_map(|hit| Uuid::parse_str(hit.payload).ok())
-            .filter(|other| *other != id)
+            .filter_map(|hit| {
+                Uuid::parse_str(hit.payload)
+                    .ok()
+                    .map(|nid| (nid, hit.distance))
+            })
+            .filter(|(other, _)| *other != id)
             .collect::<Vec<_>>();
-        keys.sort();
-        keys.dedup();
-        Ok(keys)
+        hits.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        hits.dedup_by(|a, b| a.0 == b.0);
+        Ok(hits.into_iter().map(|(nid, _)| nid).collect())
     }
 
     pub fn save(&self) -> Result<()> {

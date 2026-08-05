@@ -6,7 +6,7 @@ use crate::geometry::{Basin, HotState};
 use crate::inversion::{self, InversionOp, collapse_risk};
 use crate::lexical::LexicalIndex;
 use crate::packet::{MemoryPacket, VqCodebook};
-use crate::physics::{DreamReport, dream};
+use crate::physics::{DreamReport, dream, dream_with_progress, domain_state_color};
 use crate::pick::{MemoryPickSet, PickConfig};
 use crate::qdrant::QdrantIndex;
 use crate::record::{MemoryRecord, RecallFilters, RecallHit};
@@ -14,9 +14,48 @@ use crate::retrieval::RetrievalEngine;
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, broadcast};
 use uuid::Uuid;
+
+/// Per-document field geometry attached to a SciFact source id (when present in hot).
+#[derive(Debug, Clone, Serialize)]
+pub struct GeometrySignal {
+    pub memory_id: Uuid,
+    pub position: [f32; 3],
+    pub basin_id: Option<String>,
+    pub domain: String,
+    pub radiance: f32,
+    pub mass: f32,
+}
+
+#[derive(Debug, Clone)]
+pub struct RetrievalArms {
+    pub bm25_ids: Vec<Uuid>,
+    pub dense_ids: Vec<Uuid>,
+    pub bm25_source_ids: HashSet<String>,
+    pub dense_source_ids: HashSet<String>,
+    pub hybrid: Vec<RecallHit>,
+    pub geometry: HashMap<String, GeometrySignal>,
+}
+
+/// One live-field frame for the SplatLens SSE feed / frame log.
+#[derive(Debug, Clone, Serialize)]
+pub struct LiveFrame {
+    pub step: usize,
+    pub kinetic_energy: f32,
+    pub basins: usize,
+    pub dream_cycle: u64,
+    pub dreaming: bool,
+    pub done: bool,
+    /// Compact positions [x,y,z, …] length = 3 * n_splats (memories view).
+    pub positions: Vec<f32>,
+    /// RGBA bytes length = 4 * n_splats.
+    pub colors: Vec<u8>,
+    pub n: usize,
+}
 
 pub struct MemoryService {
     pub config: AppConfig,
@@ -29,6 +68,10 @@ pub struct MemoryService {
     records: RwLock<HashMap<Uuid, MemoryRecord>>,
     hot: RwLock<HotState>,
     mutation: Mutex<()>,
+    live_tx: broadcast::Sender<LiveFrame>,
+    dreaming: AtomicBool,
+    /// Optional append-only frame log for disk watching (set via env or serve).
+    live_log: RwLock<Option<PathBuf>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -110,6 +153,7 @@ impl MemoryService {
         let lexical = LexicalIndex::open(config.lexical_path())?;
         let ann = KeyedAnn::open(config.ann_graph_path(), 64, &config.retrieval)?;
         let hot = HotState::load(&config.hot_state_path())?;
+        let (live_tx, _) = broadcast::channel(16);
         Ok(Self {
             config,
             cold,
@@ -121,7 +165,94 @@ impl MemoryService {
             records: RwLock::new(records),
             hot: RwLock::new(hot),
             mutation: Mutex::new(()),
+            live_tx,
+            dreaming: AtomicBool::new(false),
+            live_log: RwLock::new(None),
         })
+    }
+
+    pub fn set_live_log_path(&self, path: Option<PathBuf>) {
+        *self.live_log.write().expect("live_log lock") = path;
+    }
+
+    pub fn subscribe_live(&self) -> broadcast::Receiver<LiveFrame> {
+        self.live_tx.subscribe()
+    }
+
+    pub fn is_dreaming(&self) -> bool {
+        self.dreaming.load(Ordering::Relaxed)
+    }
+
+    pub fn current_live_frame(&self) -> LiveFrame {
+        let ke = self.hot_read().kinetic_energy;
+        self.snapshot_live_frame(0, ke, self.is_dreaming(), false)
+    }
+
+    /// Recolor the hot field by domain/basin for static viewing (no physics).
+    pub fn recolor_field(&self) -> Result<()> {
+        let mut hot = self.hot_write();
+        for splat in &mut hot.splats {
+            splat.color_rgba = domain_state_color(&splat.domain, splat.basin_id.as_deref(), 0.0);
+        }
+        drop(hot);
+        self.persist_hot_and_ann()?;
+        let frame = self.snapshot_live_frame(0, self.hot_read().kinetic_energy, false, false);
+        let _ = self.live_tx.send(frame);
+        Ok(())
+    }
+
+    fn snapshot_live_frame(
+        &self,
+        step: usize,
+        kinetic_energy: f32,
+        dreaming: bool,
+        done: bool,
+    ) -> LiveFrame {
+        let hot = self.hot_read();
+        let n = hot.splats.len();
+        let mut positions = Vec::with_capacity(n * 3);
+        let mut colors = Vec::with_capacity(n * 4);
+        for splat in &hot.splats {
+            positions.extend_from_slice(&splat.position);
+            colors.extend_from_slice(&splat.color_rgba);
+        }
+        LiveFrame {
+            step,
+            kinetic_energy,
+            basins: hot.basins.len(),
+            dream_cycle: hot.dream_cycle,
+            dreaming,
+            done,
+            positions,
+            colors,
+            n,
+        }
+    }
+
+    fn emit_live_frame(&self, frame: LiveFrame) {
+        if let Ok(guard) = self.live_log.read() {
+            if let Some(path) = guard.as_ref() {
+                if let Ok(line) = serde_json::to_string(&serde_json::json!({
+                    "step": frame.step,
+                    "kinetic_energy": frame.kinetic_energy,
+                    "basins": frame.basins,
+                    "dream_cycle": frame.dream_cycle,
+                    "dreaming": frame.dreaming,
+                    "done": frame.done,
+                    "n": frame.n,
+                })) {
+                    use std::io::Write;
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(path)
+                    {
+                        let _ = writeln!(f, "{line}");
+                    }
+                }
+            }
+        }
+        let _ = self.live_tx.send(frame);
     }
 
     pub async fn initialize(&self) -> Result<()> {
@@ -242,6 +373,108 @@ impl MemoryService {
         .await
     }
 
+    /// Separate retrieval arms for miss classification (BM25 vs dense vs hybrid rank).
+    ///
+    /// - `bm25_ids` / `dense_ids`: memory UUIDs in each arm's top-`candidate_limit`
+    /// - `hybrid`: full hybrid recall ranked list (length `hybrid_limit`)
+    /// - dense = local HNSW ∪ Qdrant (when enabled)
+    pub async fn retrieval_arms(
+        &self,
+        query: &str,
+        candidate_limit: usize,
+        hybrid_limit: usize,
+        filters: &RecallFilters,
+    ) -> Result<RetrievalArms> {
+        let candidate_limit = candidate_limit.clamp(1, 500);
+        let hybrid_limit = hybrid_limit.clamp(1, 100);
+        let records = self.records_read().clone();
+        let hot = self.hot_read().clone();
+
+        let lexical = self.lexical.search(query, candidate_limit)?;
+        let full_query = self.embedding.embed(query).await?;
+        let local_query = matryoshka64(&full_query)?;
+        let local_dense = self.ann.search(&local_query, candidate_limit)?;
+        let qdrant_dense = self.qdrant.search(&full_query, candidate_limit).await?;
+
+        let mut bm25_ids = Vec::new();
+        let mut bm25_source = HashMap::new();
+        for hit in &lexical {
+            if let Some(mem) = records.get(&hit.id) {
+                if !mem.matches(filters) {
+                    continue;
+                }
+                bm25_ids.push(hit.id);
+                if let Some(sid) = &mem.source_record_id {
+                    bm25_source.insert(sid.clone(), hit.id);
+                }
+            }
+        }
+
+        let mut dense_ids = Vec::new();
+        let mut dense_seen = HashSet::new();
+        let mut dense_source = HashMap::new();
+        let mut push_dense = |id: Uuid| {
+            if !dense_seen.insert(id) {
+                return;
+            }
+            if let Some(mem) = records.get(&id) {
+                if !mem.matches(filters) {
+                    return;
+                }
+                dense_ids.push(id);
+                if let Some(sid) = &mem.source_record_id {
+                    dense_source.insert(sid.clone(), id);
+                }
+            }
+        };
+        for hit in &local_dense {
+            push_dense(hit.id);
+        }
+        for hit in &qdrant_dense {
+            push_dense(hit.id);
+        }
+
+        let hybrid = RetrievalEngine {
+            embedding: &self.embedding,
+            qdrant: &self.qdrant,
+            ann: &self.ann,
+            lexical: &self.lexical,
+            config: &self.config.retrieval,
+        }
+        .recall(query, hybrid_limit, filters, &records, &hot)
+        .await?;
+
+        // Geometry for residual signal: 3d position + basin from hot field.
+        let splat_map = hot.splat_map();
+        let mut geometry = HashMap::new();
+        for mem in records.values() {
+            if let Some(sid) = &mem.source_record_id {
+                if let Some(splat) = splat_map.get(&mem.id) {
+                    geometry.insert(
+                        sid.clone(),
+                        GeometrySignal {
+                            memory_id: mem.id,
+                            position: splat.position,
+                            basin_id: splat.basin_id.clone(),
+                            domain: splat.domain.clone(),
+                            radiance: splat.radiance,
+                            mass: splat.mass,
+                        },
+                    );
+                }
+            }
+        }
+
+        Ok(RetrievalArms {
+            bm25_ids,
+            dense_ids,
+            bm25_source_ids: bm25_source.keys().cloned().collect(),
+            dense_source_ids: dense_source.keys().cloned().collect(),
+            hybrid,
+            geometry,
+        })
+    }
+
     /// Pick memories for a live steering host, with the knobs to apply them.
     ///
     /// Deliberately over-fetches to a depth that does **not** track `limit`: `separation` needs
@@ -283,6 +516,109 @@ impl MemoryService {
             dream(&mut hot, &self.ann, &self.config.physics)?
         };
         self.persist_hot_and_ann()?;
+        Ok(report)
+    }
+
+    /// Dream with live frames every `emit_every` steps. Publishes to SSE subscribers.
+    /// Blocks until the dream finishes. Only one dream at a time.
+    pub async fn dream_live(&self, emit_every: usize) -> Result<DreamReport> {
+        if self
+            .dreaming
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            anyhow::bail!("dream already running");
+        }
+        let emit_every = emit_every.max(1);
+        let _guard = self.mutation.lock().await;
+        // Physics is O(N²) CPU; keep the async runtime free for SSE while we run.
+        let result = tokio::task::block_in_place(|| self.dream_live_inner(emit_every));
+        self.dreaming.store(false, Ordering::SeqCst);
+        result
+    }
+
+    fn dream_live_inner(&self, emit_every: usize) -> Result<DreamReport> {
+        {
+            let mut hot = self.hot_write();
+            for splat in &mut hot.splats {
+                splat.color_rgba =
+                    domain_state_color(&splat.domain, splat.basin_id.as_deref(), 0.0);
+            }
+            let n = hot.splats.len();
+            let mut positions = Vec::with_capacity(n * 3);
+            let mut colors = Vec::with_capacity(n * 4);
+            for splat in &hot.splats {
+                positions.extend_from_slice(&splat.position);
+                colors.extend_from_slice(&splat.color_rgba);
+            }
+            let start = LiveFrame {
+                step: 0,
+                kinetic_energy: hot.kinetic_energy,
+                basins: hot.basins.len(),
+                dream_cycle: hot.dream_cycle,
+                dreaming: true,
+                done: false,
+                positions,
+                colors,
+                n,
+            };
+            drop(hot);
+            self.emit_live_frame(start);
+        }
+
+        let report = {
+            let mut hot = self.hot_write();
+            let tx = self.live_tx.clone();
+            let log_path = self.live_log.read().ok().and_then(|g| g.clone());
+            dream_with_progress(
+                &mut hot,
+                &self.ann,
+                &self.config.physics,
+                emit_every,
+                |step, energy, hot| {
+                    let n = hot.splats.len();
+                    let mut positions = Vec::with_capacity(n * 3);
+                    let mut colors = Vec::with_capacity(n * 4);
+                    for splat in &hot.splats {
+                        positions.extend_from_slice(&splat.position);
+                        colors.extend_from_slice(&splat.color_rgba);
+                    }
+                    let frame = LiveFrame {
+                        step,
+                        kinetic_energy: energy,
+                        basins: hot.basins.len(),
+                        dream_cycle: hot.dream_cycle,
+                        dreaming: true,
+                        done: false,
+                        positions,
+                        colors,
+                        n,
+                    };
+                    if let Some(path) = &log_path {
+                        if let Ok(line) = serde_json::to_string(&serde_json::json!({
+                            "step": frame.step,
+                            "kinetic_energy": frame.kinetic_energy,
+                            "basins": frame.basins,
+                            "n": frame.n,
+                        })) {
+                            use std::io::Write;
+                            if let Ok(mut f) = std::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(path)
+                            {
+                                let _ = writeln!(f, "{line}");
+                            }
+                        }
+                    }
+                    let _ = tx.send(frame);
+                },
+            )?
+        };
+        self.persist_hot_and_ann()?;
+        let mut done = self.snapshot_live_frame(report.steps, report.kinetic_energy, false, true);
+        done.basins = report.basins;
+        self.emit_live_frame(done);
         Ok(report)
     }
 
