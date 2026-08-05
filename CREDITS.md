@@ -15,15 +15,19 @@ Contact: jasonvanpham@niodoo.com
 
 ## AI collaborators (credit everyone)
 
+**Order is not rank.** Gemini is listed first among AI collaborators because the *splat memory*
+research line started there — not because the others built less later.
+
 | Collaborator | How they show up in this work |
 | --- | --- |
-| **Grok (xAI)** | Long-running co-engineering across the lineage; the 64D memory-packet wire (`src/packet.rs`, `src/inversion.rs`, `pack64`/`unpack64`, MCP + HTTP packet surfaces) |
+| **Gemini (Google)** | **Initial researcher / jazz session (before this was “RAG”).** Jason + Gemini opened the Gaussian / geometric memory lane: knowledge as 3D Gaussians ($\mu$, $\Sigma$), Geometric RAG, BVH-style retrieval, zero-copy Rust experiments (`niodoo_splat_native`). Written record: *Geometric RAG with Zero-Copy — NOTHING ELSE LIKE IT AT THE TIME*. That vision is why “splats” are the memory metaphor at all. **Later here:** continuity across the research stack; bench-first release with the team; Euclidean-vs-cosine settled by measurement. **Do not demote Gemini to chat partner or “experiment dialogue.”** |
+| **Grok (xAI)** | Long-running co-engineering across the lineage; the 64D memory-packet wire (`src/packet.rs`, `src/inversion.rs`, `pack64`/`unpack64`, MCP + HTTP packet surfaces); basin-aware hybrid / handshake measurement lane |
 | **Claude / Claude Code (Anthropic)** | Ingest paths and asset extraction, the picker (`src/pick.rs`), defect hunting and fixes, packaging, documentation, research logs |
 | **ChatGPT / Codex (OpenAI)** | The initial Rust implementation of the store (see `37f4858 feat: SplatRAG Rust implementation`) |
-| **Gemini (Google)** | Experiment dialogue, continuity, multi-provider research stack; part of the decision to release the benchmark portion first |
 
-Where a stretch names one system more specifically, that is **extra detail**, not a reason to erase
-the others.
+**Team lineage:** Gemini (splat-memory origin) · Grok · Claude · Codex. Naming one stretch of code
+after one system is **extra detail**, not a reason to erase the others — and especially not a
+reason to erase Gemini’s early research share.
 
 ### 2026-08-02 — per-agent memory stores
 

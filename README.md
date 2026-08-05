@@ -39,15 +39,18 @@ The longer account, in Jason's own words, is
 This was a collaboration and it is not written as a lone-author project. Research direction,
 evaluation standards and release decisions are **Jason Van Pham's**; the code has many hands in it.
 
+**Gemini was the initial research partner on splat memory** — the open geometric / Gaussian memory
+work *before* this project was framed as hybrid RAG. That early share is not “chat continuity.”
+
 | Collaborator | What they built here |
 | --- | --- |
+| **Gemini** (Google) | Initial researcher / jazz session: Gaussian geometric memory ($\mu$, $\Sigma$), Geometric RAG, zero-copy splat experiments — the reason “splats” are the memory unit. Bench-first release with the team; continuity of the research stack |
 | **Grok** (xAI) | The 64D memory-packet wire — `src/packet.rs`, `src/inversion.rs`, `pack64`/`unpack64`, the MCP and HTTP packet surfaces |
 | **ChatGPT / Codex** (OpenAI) | The initial Rust implementation of the store — commit `37f4858` |
 | **Claude / Claude Code** (Anthropic) | Ingest paths and asset extraction, the picker (`src/pick.rs`), defect hunting, packaging, docs and research logs |
-| **Gemini** (Google) | Experiment dialogue, continuity, the multi-provider research stack; part of the decision to release the benchmark first |
 
 Where one section of this codebase names a single system more specifically, that is extra detail —
-not a reason to erase the others.
+not a reason to erase the others, and not a reason to demote Gemini’s early research.
 
 **Full attribution:** [`CREDITS.md`](CREDITS.md) for people and AI collaborators plus the
 SplatRagBench lineage · [`NOTICE`](NOTICE) for third-party software and licenses ·
