@@ -1,20 +1,20 @@
 //! The picker: decide **which** memories a live model should be steered toward, and **how hard**.
 //!
 //! Retrieval answers "what is relevant". Steering needs two more answers retrieval never gives:
-//! which of the relevant memories is worth spending steering budget on, and at what α. That gap is
-//! the reason a working memory store and a working steering rig have never actually been joined.
+//! which of the relevant memories is worth spending steering budget on, and at what α.
 //!
-//! # Why this carries text and not vectors
+//! # Why this emits addresses, not a pile of text
 //!
 //! SplatRAG semantics are 64-d unit vectors — a matryoshka slice of a Qwen3-Embedding-8B space.
-//! A live steering host (hydrodynamic-swarm) works in its own model's residual space: 2560-d for
-//! the Gemma 3 4B store, un-normalized, with scar centers at L2 ≈ 141. Those two spaces share no
-//! basis and no scale, and no trained 64→2560 decoder exists.
+//! A live steering host (hydrodynamic-swarm) works in its own model's residual space. Those two
+//! spaces share no basis. Feeding `semantics_64` into a residual would steer on noise. Dumping
+//! 2000 characters of chat so the host can re-embed is the same class of mistake: it turns a
+//! locator into a prompt injection, and OCR'd screenshots dominate the mean.
 //!
-//! Feeding `semantics_64` into a residual would not error. It would steer confidently on noise.
-//! So the pick carries the memory's **text**, and the host embeds it with its *own* encoder — the
-//! dimension gap stops being a conversion problem and becomes a non-problem. `semantics_64` rides
-//! along for telemetry and dedup only, and [`Pick::injection`] says so on the wire.
+//! The wire payload is an **address**. Pin: `memory_id` set. Room: `basin_id` set, `memory_id`
+//! omitted (first hit of that room) so pick JSON feeds the already-wired room steer. The host
+//! looks that up in its own store, or refuses. `inspect` is a short human preview. `semantics_64`
+//! is telemetry / dedup only. [`Pick::injection`] is [`Injection::Address`].
 //!
 //! # What actually ranks on a real corpus
 //!
@@ -30,13 +30,18 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// Text budget per pick, in characters.
+/// Wire schema. v1 shipped a text pile (`injection: text`). v2 ships addresses.
+pub const WIRE_VERSION: u32 = 2;
+
+/// Inspect preview per pick, in characters. Not the injection payload.
 ///
-/// The consumer embeds this string, so an unbounded payload is a real cost: OCR'd screenshots in
-/// this corpus reach tens of kilobytes, which would dominate a mean-pooled embedding with
-/// boilerplate and blow the host's context. 2000 chars is ~500 tokens — enough for a full
-/// conversational turn, which is the unit memories are stored in.
-pub const DEFAULT_TEXT_BUDGET: usize = 2000;
+/// Live `--limit 2` on the personal store (2026-08-20) returned 1981-char truncated chats as
+/// `injection: text`. That is a prompt dump, not an address. 240 chars is enough to see which
+/// turn it is.
+pub const DEFAULT_INSPECT_CHARS: usize = 240;
+
+/// Deprecated name for [`DEFAULT_INSPECT_CHARS`]. CLI `--text-budget` still maps here.
+pub const DEFAULT_TEXT_BUDGET: usize = DEFAULT_INSPECT_CHARS;
 
 /// Total steering α to spend across the whole pick set — **not** per pick.
 ///
@@ -73,9 +78,19 @@ pub struct PickConfig {
     pub limit: usize,
     /// Drop candidates scoring below this. 0.0 keeps everything retrieval returned.
     pub min_score: f32,
+    /// Inspect preview chars. Not an embeddable payload.
     pub text_budget: usize,
     /// Total α shared across all picks. See [`DEFAULT_GAIN_BUDGET`].
     pub gain_budget: f32,
+    /// Re-rank the pick pool with ant-slime hybrid. Off by default — SciFact freeze
+    /// and live silo pick do not take this path.
+    pub hybrid: bool,
+    /// Persist `Splat.usage` on the chosen pick. Scratch-store only. Off by default.
+    pub track_usage: bool,
+    /// Hybrid β. 0 = habit only. Default 2 = meaning can fight leftover τ.
+    pub hybrid_beta: f32,
+    /// Easyway: collapse high I_R τ this cycle. Off until the cage is measured.
+    pub easyway: bool,
 }
 
 impl Default for PickConfig {
@@ -85,8 +100,12 @@ impl Default for PickConfig {
             // pulls the residual toward the mean of the set.
             limit: 3,
             min_score: 0.0,
-            text_budget: DEFAULT_TEXT_BUDGET,
+            text_budget: DEFAULT_INSPECT_CHARS,
             gain_budget: DEFAULT_GAIN_BUDGET,
+            hybrid: false,
+            track_usage: false,
+            hybrid_beta: 2.0,
+            easyway: false,
         }
     }
 }
@@ -95,8 +114,22 @@ impl Default for PickConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Injection {
-    /// Embed `text` with your own encoder. `semantics_64` is telemetry — never a residual.
-    Text,
+    /// Look up [`PickAddress`]. Do not embed `inspect` / leftover `text` into a residual.
+    Address,
+}
+
+/// Locator for one pin or one room. Stable ids, not the turn's prose.
+///
+/// Pin: `memory_id` set. Room: `basin_id` set and `memory_id` omitted. Matches
+/// [`crate::service::SteerAddress`] so pick JSON can pass straight into steer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PickAddress {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub basin_id: Option<String>,
+    pub source: String,
+    pub domain: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,6 +144,7 @@ pub struct MemoryPickSet {
     pub source_dim: usize,
     /// Confidence that the store holds an answer at all: the top hit's cosine as a z-score above
     /// the null, scaled by [`RELEVANCE_FULL_Z`]. This is what sets steering strength.
+    /// Live 2026-08-20: BM25-only hits have cosine 0, so this is often 0 even when recall is right.
     pub confidence: f32,
     /// Diagnostic only. The gap between the top two hits. Reported because it is informative about
     /// *shape* — low separation with high confidence means several memories are jointly relevant,
@@ -118,8 +152,19 @@ pub struct MemoryPickSet {
     pub separation: f32,
     /// The baseline `confidence` was measured against.
     pub null: NullModel,
-    /// Standard deviations the top hit sits above the null.
-    pub top_z: f32,
+    /// Standard deviations the top hit sits above the null — `None` when the dense arm never
+    /// scored it.
+    ///
+    /// A BM25-only win carries cosine 0.0, which [`crate::retrieval`] uses as the sentinel for "the
+    /// ANN never returned this candidate". Handing that sentinel to [`NullModel::z`] does not
+    /// report a bad match, it reports `(0 − mean)/std` — a fixed, query-independent number that is
+    /// a property of the null and not of the hit. Measured 2026-08-22 against the personal store it
+    /// read −3.9σ on two queries the picker had answered correctly. Hence `Option` and not a float:
+    /// the z of an unmeasured cosine is undefined, not negative.
+    ///
+    /// `confidence` already routes those queries through the lexical arm, so `top_z: null` beside a
+    /// nonzero `confidence` is the honest reading of "dense missed, lexical carried it".
+    pub top_z: Option<f32>,
     /// Sum of `suggested_gain` over every pick. Bounded by the configured budget, so loading more
     /// memories divides the push instead of stacking it. Report this in any multi-memory run —
     /// it is the confound that would otherwise be mistaken for a memory-count effect.
@@ -130,9 +175,14 @@ pub struct MemoryPickSet {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Pick {
     pub memory_id: Uuid,
-    /// **The payload.** Embed this with your own encoder.
+    /// **The payload.** Host looks this up. Do not treat `inspect` as the payload.
+    pub address: PickAddress,
+    /// Short human preview. Not injectable.
+    pub inspect: String,
+    /// Leftover v1 field. Empty on v2 so a consumer that still embeds `text` gets nothing.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub text: String,
-    /// True when `text` was cut to the budget.
+    /// True when `inspect` was cut to the budget.
     #[serde(default)]
     pub text_truncated: bool,
     pub injection: Injection,
@@ -157,6 +207,12 @@ pub struct Pick {
     pub domain: String,
     pub source: String,
     pub timestamp: Option<DateTime<Utc>>,
+    /// Retrieval-usage τ from the splat. Not radiance.
+    #[serde(default)]
+    pub usage: f32,
+    /// Tube conductivity D from the splat.
+    #[serde(default)]
+    pub conductivity: f32,
 }
 
 /// Build a pick set from retrieval hits plus the settled field.
@@ -178,11 +234,19 @@ pub fn build(
 
     // Judged on the full ranked list, not the truncated one: a candidate excluded from steering is
     // still evidence about the shape of the field.
-    let top_cosine = hits.first().map(|hit| hit.scores.cosine).unwrap_or(0.0);
-    let confidence = relevance(top_cosine, &null);
+    // Cosine 0.0 is retrieval's ANN-miss sentinel, not a measured similarity, so it is dropped
+    // rather than z-scored. See [`MemoryPickSet::top_z`].
+    let top_cosine = hits
+        .first()
+        .map(|hit| hit.scores.cosine)
+        .filter(|cosine| *cosine != 0.0);
+    let confidence = relevance_from_hits(hits, &null);
     let separation = separation(hits);
     let shares = budget_shares(&kept);
 
+    // Limit counts hits (pins). First hit of a room emits a basin-only address so
+    // pick JSON can feed room steer; later members of that room stay pins.
+    let mut seen_rooms = std::collections::HashSet::new();
     let picks: Vec<Pick> = kept
         .iter()
         .zip(&shares)
@@ -191,12 +255,27 @@ pub fn build(
                 .splats
                 .iter()
                 .find(|splat| splat.memory_id == hit.memory.id);
-            let (text, text_truncated) = clip(&hit.memory.text, config.text_budget);
+            let (inspect, text_truncated) = clip(&hit.memory.text, config.text_budget);
+            let room_first = hit
+                .basin_id
+                .as_ref()
+                .is_some_and(|id| seen_rooms.insert(id.clone()));
             Pick {
                 memory_id: hit.memory.id,
-                text,
+                address: PickAddress {
+                    memory_id: if room_first {
+                        None
+                    } else {
+                        Some(hit.memory.id)
+                    },
+                    basin_id: hit.basin_id.clone(),
+                    source: hit.memory.source.clone(),
+                    domain: hit.memory.domain.clone(),
+                },
+                inspect,
+                text: String::new(),
                 text_truncated,
-                injection: Injection::Text,
+                injection: Injection::Address,
                 score: hit.scores.final_score,
                 cosine: hit.scores.cosine,
                 bm25: hit.scores.bm25,
@@ -212,6 +291,8 @@ pub fn build(
                 domain: hit.memory.domain.clone(),
                 source: hit.memory.source.clone(),
                 timestamp: hit.memory.timestamp,
+                usage: splat.map(|s| s.usage).unwrap_or(0.0),
+                conductivity: splat.map(|s| s.conductivity).unwrap_or(1.0),
             }
         })
         .collect();
@@ -219,7 +300,7 @@ pub fn build(
     let total_suggested_gain = picks.iter().map(|pick: &Pick| pick.suggested_gain).sum();
 
     MemoryPickSet {
-        version: 1,
+        version: WIRE_VERSION,
         prompt: prompt.to_string(),
         generated_at: Utc::now(),
         source_embedder: embedder.to_string(),
@@ -227,7 +308,7 @@ pub fn build(
         confidence,
         separation,
         null,
-        top_z: null.z(top_cosine),
+        top_z: top_cosine.map(|cosine| null.z(cosine)),
         total_suggested_gain,
         picks,
     }
@@ -323,6 +404,49 @@ pub fn relevance(top_cosine: f32, null: &NullModel) -> f32 {
         return 0.0;
     }
     (null.z(top_cosine) / RELEVANCE_FULL_Z).clamp(0.0, 1.0)
+}
+
+/// Chosen floor, not a fit. Live 2026-08-20: `"the physics of friendship"` had
+/// BM25 hits and cosine 0 (ANN miss), so cosine-z confidence was 0 and α was 0.
+/// If the lexical pool is too small for a std, this is the push we still spend.
+pub const LEXICAL_ANN_MISS_FLOOR: f32 = 0.5;
+
+/// Confidence from the top hit, not cosine alone.
+///
+/// Dense: cosine-z vs the field null. Lexical: BM25-z vs the rest of the
+/// confidence pool. Friendship-style ANN misses take the lexical arm so a
+/// named room still gets push.
+pub fn relevance_from_hits(hits: &[RecallHit], null: &NullModel) -> f32 {
+    let dense = hits
+        .first()
+        .map(|hit| relevance(hit.scores.cosine, null))
+        .unwrap_or(0.0);
+    dense.max(lexical_relevance(hits))
+}
+
+fn lexical_relevance(hits: &[RecallHit]) -> f32 {
+    let bm25: Vec<f32> = hits
+        .iter()
+        .take(CONFIDENCE_POOL)
+        .map(|hit| hit.scores.bm25)
+        .collect();
+    let Some(&top) = bm25.first() else {
+        return 0.0;
+    };
+    if top <= 0.0 {
+        return 0.0;
+    }
+    if bm25.len() < 3 {
+        return LEXICAL_ANN_MISS_FLOOR;
+    }
+    let rest = &bm25[1..];
+    let mean = rest.iter().sum::<f32>() / rest.len() as f32;
+    let variance = rest.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / rest.len() as f32;
+    let std = variance.sqrt();
+    if std < 1e-6 {
+        return LEXICAL_ANN_MISS_FLOOR;
+    }
+    (((top - mean) / std) / RELEVANCE_FULL_Z).clamp(0.0, 1.0)
 }
 
 /// How cleanly the top hit separates from the rest of the candidate pool.
@@ -442,19 +566,166 @@ mod tests {
     }
 
     #[test]
-    fn pick_carries_text_and_refuses_to_present_semantics_as_injectable() {
+    fn lexical_ann_miss_still_gets_push() {
+        let mut a = hit("a", "friendship", 0.26);
+        a.scores.cosine = 0.0;
+        a.scores.bm25 = 13.2;
+        let mut b = hit("b", "other", 0.26);
+        b.scores.cosine = 0.0;
+        b.scores.bm25 = 12.7;
+        let null = NullModel {
+            mean: 0.2,
+            std: 0.1,
+            samples: 256,
+        };
+        assert_eq!(
+            relevance(0.0, &null),
+            0.0,
+            "cosine-only confidence is the live bug"
+        );
+        let conf = relevance_from_hits(&[a.clone(), b.clone()], &null);
+        assert!(
+            (conf - LEXICAL_ANN_MISS_FLOOR).abs() < 1e-5,
+            "two BM25 hits and no cosine must still spend, got {conf}"
+        );
+        let hot = hot_with(&[a.clone(), b.clone()], 0.0, 1.0);
+        let set = build(
+            "the physics of friendship",
+            &[a, b],
+            &hot,
+            "e",
+            null,
+            &PickConfig {
+                limit: 2,
+                ..PickConfig::default()
+            },
+        );
+        assert!(set.confidence > 0.0);
+        assert!(set.total_suggested_gain > 0.0);
+        assert!(set.picks[0].suggested_gain > 0.0);
+        assert_eq!(
+            set.top_z, None,
+            "cosine 0 is an ANN miss; reporting (0-mean)/std for it invents a -3.9σ verdict \
+             on a query the picker answered"
+        );
+    }
+
+    /// The other half of the same rule: a cosine that *was* measured must still be reported.
+    #[test]
+    fn measured_top_hit_still_reports_top_z() {
+        let a = hit("a", "measured", 0.6);
+        let null = test_null();
+        let hot = hot_with(&[a.clone()], 0.0, 1.0);
+        let set = build("q", &[a], &hot, "e", null, &PickConfig::default());
+        let z = set.top_z.expect("a scored cosine must still produce a z");
+        assert!(
+            (z - null.z(0.8)).abs() < 1e-6,
+            "dense arm must be untouched, got {z}"
+        );
+        assert!(z > 0.0);
+    }
+
+    #[test]
+    fn shipped_pick_prefers_short_bridge_despite_high_radiance_on_long() {
+        let mut a = hit("A", "old habit", 0.55);
+        a.scores.cosine = 0.55;
+        a.scores.bm25 = 2.0;
+        a.scores.radiance = 0.9;
+        a.scores.final_score = 0.55;
+        let mut b = hit("B", "new relevant", 0.99);
+        b.scores.cosine = 0.99;
+        b.scores.bm25 = 8.0;
+        b.scores.radiance = 0.1;
+        b.scores.final_score = 0.99;
+        // Recall already ranked by cosine/BM25, B first. Pick must not reorder on
+        // radiance or on usage sitting unused on the splat.
+        let hits = vec![b.clone(), a.clone()];
+        let mut hot = hot_with(&hits, 0.0, 1.0);
+        for splat in &mut hot.splats {
+            if splat.memory_id == a.memory.id {
+                splat.usage = 20.0;
+                splat.radiance = 9.0;
+            }
+        }
+        let set = build(
+            "q",
+            &hits,
+            &hot,
+            "e",
+            test_null(),
+            &PickConfig {
+                limit: 2,
+                ..PickConfig::default()
+            },
+        );
+        assert_eq!(set.picks[0].memory_id, b.memory.id);
+        assert_eq!(set.picks[1].memory_id, a.memory.id);
+        assert!(
+            a.scores.radiance > b.scores.radiance,
+            "fixture must give A the radiance mass"
+        );
+        let long = set
+            .picks
+            .iter()
+            .find(|pick| pick.memory_id == a.memory.id)
+            .unwrap();
+        assert!((long.usage - 20.0).abs() < 1e-5);
+        assert!((long.conductivity - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn pick_emits_address_not_a_text_pile() {
         let hits = vec![hit("a", "the physics of friendship", 9.0)];
         let hot = hot_with(&hits, 0.0, 1.0);
-        let set = build("friendship", &hits, &hot, "Qwen3-Embedding-8B", test_null(), &PickConfig::default());
+        let set = build(
+            "friendship",
+            &hits,
+            &hot,
+            "Qwen3-Embedding-8B",
+            test_null(),
+            &PickConfig::default(),
+        );
 
+        assert_eq!(set.version, WIRE_VERSION);
         assert_eq!(set.picks.len(), 1);
         let pick = &set.picks[0];
-        assert_eq!(pick.text, "the physics of friendship");
-        assert_eq!(pick.injection, Injection::Text);
+        assert_eq!(pick.injection, Injection::Address);
+        assert!(
+            pick.address.memory_id.is_none(),
+            "first hit of a room is basin-only so pick JSON feeds room steer"
+        );
+        assert_eq!(pick.address.basin_id.as_deref(), Some("basin-a"));
+        assert_eq!(pick.memory_id, hits[0].memory.id);
+        assert_eq!(pick.inspect, "the physics of friendship");
+        assert!(pick.inspect.chars().count() <= DEFAULT_INSPECT_CHARS);
+        assert!(pick.text.is_empty(), "v2 must not ship the turn as payload");
         // The guard the consumer checks before it dares touch the floats.
         assert_eq!(set.source_dim, 64);
         assert_eq!(set.source_embedder, "Qwen3-Embedding-8B");
         assert_eq!(pick.semantics_64.len(), 64);
+    }
+
+    #[test]
+    fn two_picks_top_hit_takes_most_of_the_budget_by_score_share() {
+        // Linear scores, not RRF: this is the picker's own split. Live personal RRF
+        // `--limit 2` is often ~50/50 because ranks are consecutive.
+        let hits = vec![hit("a", "winner", 10.0), hit("b", "runner", 1.0)];
+        let hot = hot_with(&hits, 0.0, 1.0);
+        let set = build(
+            "q",
+            &hits,
+            &hot,
+            "e",
+            test_null(),
+            &PickConfig {
+                limit: 2,
+                ..PickConfig::default()
+            },
+        );
+        assert_eq!(set.picks.len(), 2);
+        assert!((set.picks[0].budget_share - 10.0 / 11.0).abs() < 1e-5);
+        assert!(set.picks[0].suggested_gain > set.picks[1].suggested_gain);
+        assert!(set.total_suggested_gain <= ALPHA_MAX + 1e-5);
     }
 
     #[test]
@@ -513,7 +784,10 @@ mod tests {
             (plain - shifted).abs() < 1e-5,
             "offset moved confidence: {plain} vs {shifted}"
         );
-        assert!(plain > 0.7, "6 vs 2 over a 5-wide spread should be clear, got {plain}");
+        assert!(
+            plain > 0.7,
+            "6 vs 2 over a 5-wide spread should be clear, got {plain}"
+        );
     }
 
     #[test]
@@ -557,7 +831,10 @@ mod tests {
 
         // Same total push regardless of how many memories carry it — that is what makes the
         // 1-vs-2-vs-3 comparison clean.
-        assert!((totals[0] - totals[2]).abs() < 1e-5, "totals drifted: {totals:?}");
+        assert!(
+            (totals[0] - totals[2]).abs() < 1e-5,
+            "totals drifted: {totals:?}"
+        );
 
         // The top hit still gets the largest share; picks are not interchangeable.
         let set = build("q", &hits, &hot, "e", test_null(), &PickConfig::default());
@@ -617,7 +894,11 @@ mod tests {
 
     #[test]
     fn long_memories_are_clipped_at_a_sentence_and_flagged() {
-        let text = format!("{} Final sentence here.{}", "padding. ".repeat(40), "x".repeat(400));
+        let text = format!(
+            "{} Final sentence here.{}",
+            "padding. ".repeat(40),
+            "x".repeat(400)
+        );
         let hits = vec![hit("a", &text, 9.0)];
         let hot = hot_with(&hits, 0.0, 1.0);
         let config = PickConfig {
@@ -628,9 +909,10 @@ mod tests {
 
         let pick = &set.picks[0];
         assert!(pick.text_truncated);
-        assert!(pick.text.chars().count() <= 400);
+        assert!(pick.inspect.chars().count() <= 400);
+        assert!(pick.text.is_empty());
         // Clipped on a boundary, not mid-word.
-        assert!(pick.text.ends_with('.'), "got tail {:?}", pick.text);
+        assert!(pick.inspect.ends_with('.'), "got tail {:?}", pick.inspect);
     }
 
     #[test]
@@ -663,11 +945,62 @@ mod tests {
     #[test]
     fn a_memory_with_no_splat_gets_neutral_knobs_not_zero_mass() {
         let hits = vec![hit("orphan", "never dreamed", 9.0)];
-        let set = build("q", &hits, &HotState::default(), "e", test_null(), &PickConfig::default());
+        let set = build(
+            "q",
+            &hits,
+            &HotState::default(),
+            "e",
+            test_null(),
+            &PickConfig::default(),
+        );
         let pick = &set.picks[0];
         // Zero mass would silently drop it out of the host's force law.
         assert_eq!(pick.mass, 1.0);
         assert_eq!(pick.gain, 0.0);
         assert!(pick.semantics_64.is_empty());
+    }
+
+    #[test]
+    fn first_hit_of_a_room_is_basin_only_members_are_pins() {
+        let a = hit("a", "room member", 9.0);
+        let b = hit("b", "other member", 8.0);
+        let mut c = hit("c", "other room", 7.0);
+        c.basin_id = Some("basin-b".into());
+        let mut d = hit("d", "orphan pin", 6.0);
+        d.basin_id = None;
+        let hits = vec![a.clone(), b.clone(), c.clone(), d.clone()];
+        let hot = hot_with(&hits, 0.0, 1.0);
+        let set = build(
+            "q",
+            &hits,
+            &hot,
+            "e",
+            test_null(),
+            &PickConfig {
+                limit: 4,
+                ..PickConfig::default()
+            },
+        );
+        assert!(!set.picks.is_empty());
+        assert_eq!(set.picks.len(), 4, "limit still counts hits, not extra rooms");
+        assert!(set.picks[0].address.memory_id.is_none());
+        assert_eq!(set.picks[0].address.basin_id.as_deref(), Some("basin-a"));
+        assert_eq!(set.picks[0].memory_id, a.memory.id);
+        assert_eq!(set.picks[1].address.memory_id, Some(b.memory.id));
+        assert_eq!(set.picks[1].address.basin_id.as_deref(), Some("basin-a"));
+        assert!(set.picks[2].address.memory_id.is_none());
+        assert_eq!(set.picks[2].address.basin_id.as_deref(), Some("basin-b"));
+        assert_eq!(set.picks[3].address.memory_id, Some(d.memory.id));
+        assert!(set.picks[3].address.basin_id.is_none());
+        for pick in &set.picks {
+            assert_eq!(pick.injection, Injection::Address);
+            assert!(pick.text.is_empty());
+            assert!(pick.inspect.chars().count() <= DEFAULT_INSPECT_CHARS);
+        }
+        let room = serde_json::to_value(&set.picks[0].address).unwrap();
+        assert!(room.get("memory_id").is_none());
+        assert_eq!(room["basin_id"], "basin-a");
+        let pin = serde_json::to_value(&set.picks[1].address).unwrap();
+        assert_eq!(pin["memory_id"], b.memory.id.to_string());
     }
 }
