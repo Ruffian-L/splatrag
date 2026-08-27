@@ -1,143 +1,96 @@
 # SplatRAG
 
-SplatRAG is a local Rust AI-memory store. It keeps every imported message in an append-only cold
-log, indexes it with BM25 plus keyed HNSW and scoped Qdrant cosine search, and evolves a separate
-Gaussian-splat field into persistent, locally labeled memory basins.
+**3.0.0.** A local Rust AI-memory store.
 
-No cloud model is used. Embeddings and basin labels come from local `llama-server` instances.
-The local ANN is `fast-hnsw` with UUID strings as labels: insertion positions remain internal
-implementation details, while search ties and exported keys are sorted deterministically by UUID.
+Every imported message is appended to a cold log and never deleted. Retrieval is hybrid BM25 plus keyed HNSW over 64-d Matryoshka embeddings, with an optional full-dimension rerank. A separate Gaussian-splat field is evolved into labeled basins. A picker chooses which memories steer a live model, and how hard.
 
-## Where this came from
+Embeddings and optional basin labels come from local `llama-server`. Nothing is sent to a cloud model.
 
-*— Jason Van Pham*
+The local ANN is `fast-hnsw` with UUID labels: insertion positions stay internal; search ties and exported keys are sorted by UUID.
 
-This originated from [SplatRagBench](https://github.com/Ruffian-L/SplatRagBench). When we first
-released SplatRAG the whole system wasn't polished yet, so we — me, Grok, Claude and Gemini —
-decided to release just the bench portion. That was special to me: the first project that married a
-lot of individual concepts.
-
-**Why splats?** Because to me a memory starts as an image. And as time goes on, or as my perception
-of it changes, the image changes too — and so does the history that builds around it. So when I
-watched a Gaussian splatting video on YouTube that had Google's Genie engine in it, I thought: how do
-we save pictures and info *into* splats?
-
-Other ideas we had: make a language out of RBFs. Use light and direction — actually, light was
-supposed to be how we steered originally. That was around the time NVIDIA came out with the ray
-tracing that could relight a whole room dynamically. The possibilities are endless, and so is scope.
-
-It was over-engineered in the beginning because I had hedged that AI memory only works if you save
-everything. Things can decay naturally. Context and memories can get minted (CRDT). Originally this
-code saved into actual splats, with dreamers for clustering basins and repelling noise — but not
-*removing* the noise, because we never know what treasures we forgot about.
-
-The longer account, in Jason's own words, is
-`ghost_team_story/human_story_to_team_story.md`. It is the source for this project's history.
-
-## Credits
-
-This was a collaboration and it is not written as a lone-author project. Research direction,
-evaluation standards and release decisions are **Jason Van Pham's**; the code has many hands in it.
-
-**Gemini was the initial research partner on splat memory** — the open geometric / Gaussian memory
-work *before* this project was framed as hybrid RAG. That early share is not “chat continuity.”
-
-| Collaborator | What they built here |
-| --- | --- |
-| **Gemini** (Google) | Initial researcher / jazz session: Gaussian geometric memory ($\mu$, $\Sigma$), Geometric RAG, zero-copy splat experiments — the reason “splats” are the memory unit. Bench-first release with the team; continuity of the research stack |
-| **Grok** (xAI) | The 64D memory-packet wire — `src/packet.rs`, `src/inversion.rs`, `pack64`/`unpack64`, the MCP and HTTP packet surfaces |
-| **ChatGPT / Codex** (OpenAI) | The initial Rust implementation of the store — commit `37f4858` |
-| **Claude / Claude Code** (Anthropic) | Ingest paths and asset extraction, the picker (`src/pick.rs`), defect hunting, packaging, docs and research logs |
-
-Where one section of this codebase names a single system more specifically, that is extra detail —
-not a reason to erase the others, and not a reason to demote Gemini’s early research.
-
-**Full attribution:** [`CREDITS.md`](CREDITS.md) for people and AI collaborators plus the
-SplatRagBench lineage · [`NOTICE`](NOTICE) for third-party software and licenses ·
-[`attributions.md`](attributions.md) for llama.cpp, which `cargo metadata` cannot see but which
-SplatRAG does not run without.
-
-Model weights are **not** distributed here and are not covered by this project's MIT license.
-
-## Services
-
-- Qdrant: `http://127.0.0.1:6360`, collection `export-conversations`, filtered by `scope_key`.
-- Embedder: `http://127.0.0.1:8081`, Qwen3-Embedding-8B, 4096 dimensions.
-- Optional basin labeler: `http://127.0.0.1:8082`, local instruction model.
-
-Copy/edit the generated `splatrag.toml` if your ports or model aliases differ.
+## Quickstart
 
 ```bash
-cargo run -- init
-cargo run -- doctor
-cargo run -- ingest --source claude /path/to/conversations.json
-cargo run -- ingest --source grok /path/to/export_conversations.json
-cargo run -- ingest --source gemini /path/to/MyActivity.html
-cargo run -- ingest --source agent-jsonl /path/to/sessions
-cargo run -- ingest --source semantic-md /path/to/splat_backup_semantic_FULL_53037.md
-cargo run -- dream --label
-cargo run -- recall "what did we decide about memory clustering?"
-cargo run -- serve
+cp .env.example .env          # optional; defaults work
+./run init                    # write splatrag.toml from the template
+./run up                      # embedder, then the service
+./run recall "what did we decide about memory clustering?"
 ```
 
-The viewer is served at `http://127.0.0.1:8765`. Start the MCP stdio server with:
+The HTTP API and the 3-D viewer are at `http://127.0.0.1:8767`. `./run --help` lists the rest; unknown subcommands are passed to the engine.
+
+## Reproduce the claim
+
+```bash
+./claim.sh --smoke            # ~15 min plumbing check on a reduced corpus
+./claim.sh                    # SciFact → poison → dream → SciFact; writes a receipt
+```
+
+`./claim.sh` checks the toolchain, verifies the embedding-model hash, builds, downloads and hash-verifies SciFact, starts the embedder, runs the handshake against a fresh store, and writes `claim-receipt.json`.
+
+**Baseline going forward is the full 300 SciFact test queries**, not the first-50 slice that produced the older 0.7822 nDCG@10 figure. On the current engine, filtered SciFact+Urban (domain=`scifact` so poison cannot occupy top-10):
+
+| Slice | System | R@10 | nDCG@10 |
+| --- | --- | ---: | ---: |
+| first 50 | SplatRagBench hybrid (Nomic, 2026-08-04) | 0.9090 | 0.7822 |
+| full 300 | SplatRagBench hybrid (same binary) | 0.7876 | 0.6664 |
+| full 300 | this engine, RRF + 4096-d arm (`eval_rrf_full3_w13`) | 0.8804 | 0.7624 |
+
+Handshake floors are Recall@10 ≥ 0.88 and nDCG@10 ≥ 0.75 on that filtered full-300 run. Poison resistance is a separate check: recall drop ≤ 0.05 and the cold log is byte-identical across dream.
+
+Use a separate `data_dir` / `scope_key` so benchmark documents never enter a personal store:
+
+```bash
+cp examples/splatrag.example.toml splatrag.handshake.toml
+# set data_dir and scope_key
+
+cargo run --release -- --config splatrag.handshake.toml handshake \
+  --dataset /path/to/scifact \
+  --poison corpora/poison/urban-dictionary.jsonl
+```
+
+The poison corpus ships in-tree (`corpora/poison/`). Without `--poison`, the command reports the SciFact baseline only. `--limit` is a development sample.
+
+## Retrieval, in one paragraph
+
+Recall fuses BM25 rank with 64-d HNSW cosine rank (reciprocal rank fusion). The 64-d vectors are the first 64 dimensions of Qwen3-Embedding-8B, L2-renormalized. When `rerank = "full"`, the fusion top-`k * rerank_pool` documents are re-embedded at 4096-d and that rank is added as a third RRF arm. Radiance (dream connectivity) is a small add-on, not a third list. The 3-D picture is PCA of the 64-d vectors — a view, not the index.
+
+## Storage invariants
+
+- `data/cold/memories.jsonl` is authoritative and append-only.
+- Text equality does not deduplicate. Stable source identities make re-import idempotent.
+- Indexes, hot geometry, and basin labels are derived.
+- Dreaming changes only hot geometry and basin metadata. It never deletes cold messages.
+- Attachment paths and hashes are kept. OCR is deferred.
+
+`splatrag rebuild-index` reconstructs derived files from the cold log. Run `splatrag dream --label` afterwards if you want basins relabeled.
+
+## MCP and HTTP
 
 ```bash
 cargo run --release -- mcp
 ```
 
-Available MCP tools are `remember`, `recall`, `list_basins`, `browse_basin`, and `memory_status`.
-The viewer supports basin/memory level-of-detail, orbit and zoom, local hybrid search, basin cards,
-and click inspection of individual splats.
+Tools: `remember`, `recall`, `pick`, `steer`, `pack_64`, `unpack_64`, `list_basins`, `browse_basin`, `memory_status`, `ensure_ready`, `list_silos`. `pick` emits addresses (`memory_id` + basin), not a text dump. The same tools are on HTTP: `GET /api/tools`, `POST /api/tools/<name>`. `POST /api/recall` takes the full filter set.
 
-## Local model processes
-
-The defaults in `splatrag.toml` expect these two endpoints:
+## Local models
 
 ```bash
 llama-server --model /path/to/Qwen3-Embedding-8B-Q8_0.gguf \
   --embedding --pooling last --host 127.0.0.1 --port 8081 \
   --n-gpu-layers all --flash-attn on
-
-llama-server --model /path/to/gemma-3-4b-it-q4_0.gguf \
-  --host 127.0.0.1 --port 8082 --ctx-size 4096 \
-  --n-gpu-layers all --flash-attn on
 ```
 
-`cargo run -- doctor` verifies model dimensions, Qdrant compatibility, and cold/derived count
-parity before a large import.
+Optional basin labeler on `:8082`. `cargo run -- doctor` checks dimensions and cold/derived count parity.
 
-## Executable HANDSHAKE
+Copy `examples/splatrag.example.toml` to `splatrag.toml` and point `data_dir` **outside** the git checkout. See `DATA_LAYOUT.md`.
 
-The preserved acceptance test is implemented by the `handshake` command. It imports the SciFact
-corpus, measures Recall@10 and nDCG@10, optionally imports an Urban Dictionary poison corpus into
-the same cold store, dreams, measures again, and exits nonzero on failure. The fixed targets are
-Recall@10 ≥ 0.88, nDCG@10 ≥ 0.75, no more than 0.05 Recall loss, and byte-for-byte preservation of
-the cold log during dream.
+## Where this came from
 
-Use a separate config/scope so benchmark documents do not enter the personal memory scope:
+*— Jason Van Pham*
 
-```bash
-cp splatrag.toml splatrag.handshake.toml
-# Set a separate data_dir and scope_key in splatrag.handshake.toml.
+Memories as Gaussians started in research sessions with Gemini, before this was framed as hybrid retrieval. [SplatRagBench](https://github.com/Ruffian-L/SplatRagBench) shipped first, while the engine was still rough. This repository is the engine.
 
-cargo run --release -- --config splatrag.handshake.toml handshake \
-  --dataset /path/to/scifact \
-  --poison /path/to/urban-dictionary.jsonl
-```
+Full attribution: [`CREDITS.md`](CREDITS.md) · [`NOTICE`](NOTICE) · [`attributions.md`](attributions.md) for llama.cpp.
 
-Without `--poison`, the command runs and reports the SciFact baseline only. `--limit` is available
-for a quick development sample; omit it for an acceptance run. SciFact `_id` values are retained
-as source record keys so the evaluator scores the same identifiers present in the qrels.
-
-## Storage invariants
-
-- `data/cold/memories.jsonl` is authoritative and append-only.
-- Text equality does not deduplicate messages. Stable source identities make re-import idempotent.
-- `data/indexes/`, `data/hot/`, Tantivy, HNSW, Qdrant points, and basin labels are derived.
-- Dreaming changes only hot geometry and basin metadata; it never deletes cold messages.
-- Attachment paths and hashes are retained. OCR is intentionally deferred.
-
-`splatrag rebuild-index` moves current derived files to a timestamped backup and reconstructs all
-indices from the cold log. It does not alter the cold log. Because basins and local labels are
-derived state, run `splatrag dream --label` after a rebuild.
+Model weights are not distributed here and are not covered by the MIT license.

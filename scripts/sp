@@ -1,0 +1,318 @@
+#!/usr/bin/env bash
+# SplatRAG v3 — the only commands you need.
+#
+#   sp              how's it doing?
+#   sp start        turn it on and open the picture
+#   sp stop         hide the picture (memory stays on)
+#   sp embed up     start the memory brain
+#   sp embed down   stop the memory brain
+#
+set -uo pipefail
+
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/splatrag"
+CONF="$CONF_DIR/v3.env"
+LOG_DIR="$CONF_DIR/logs"
+mkdir -p "$CONF_DIR" "$LOG_DIR"
+
+# Defaults; install.sh writes v3.env to override.
+_SP_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ENGINE="${SPLATRAG_ENGINE:-$_SP_ROOT}"
+CONFIG="${SPLATRAG_CONFIG:-$ENGINE/splatrag.toml}"
+BIN="${SPLATRAG_BIN:-$ENGINE/target/release/splatrag}"
+VIEWER="${SPLATRAG_VIEWER:-}"
+SERVE_PORT="${SPLATRAG_LENS_PORT:-8767}"
+EMBED_PORT="${SPLATRAG_EMBED_PORT:-8081}"
+VIEWER_PORT="${SPLATRAG_VIEWER_PORT:-8767}"
+UNIT_SERVE="${SPLATRAG_UNIT_SERVE:-splatrag-serve.service}"
+UNIT_WATCH="${SPLATRAG_UNIT_WATCH:-}"
+
+if [[ -f "$CONF" ]]; then
+  # shellcheck disable=SC1090
+  set -a; . "$CONF"; set +a
+fi
+
+say()  { printf '%s\n' "$*"; }
+ok()   { printf '  on   %s\n' "$*"; }
+off()  { printf '  off  %s\n' "$*"; }
+note() { printf '       %s\n' "$*"; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+http_ok() {
+  local code
+  code=$(curl -s --max-time 2 -o /dev/null -w "%{http_code}" "http://127.0.0.1:$1/" 2>/dev/null || echo 000)
+  [[ "$code" == "200" || "$code" == "302" || "$code" == "304" ]]
+}
+
+# True if the configured viewer port answers.
+basin_ok() {
+  if curl -s --max-time 2 "http://127.0.0.1:${VIEWER_PORT}/" 2>/dev/null | grep -aqE '<title>[^<]*SplatRAG'; then
+    return 0
+  fi
+  http_ok "$VIEWER_PORT"
+}
+
+api_ok() {
+  curl -sf --max-time 2 "http://127.0.0.1:$1/api/status" >/dev/null 2>&1
+}
+
+embed_ok() {
+  if have embedder && embedder status >/dev/null 2>&1; then
+    return 0
+  fi
+  curl -sf --max-time 2 "http://127.0.0.1:$EMBED_PORT/health" >/dev/null 2>&1
+}
+
+unit_exists() {
+  have systemctl && systemctl --user cat "$1" >/dev/null 2>&1
+}
+
+unit_on() {
+  have systemctl && systemctl --user is-active --quiet "$1"
+}
+
+cmd_help() {
+  cat <<'EOF'
+SplatRAG v3
+
+  sp start        turn everything on and open the picture
+  sp stop         hide the picture (your memories stay saved)
+  sp              show on / off
+  sp embed up     start the memory brain (slow first time)
+  sp embed down   stop the memory brain
+
+That's all.
+EOF
+}
+
+cmd_status() {
+  say "SplatRAG v3"
+  say ""
+  if api_ok "$SERVE_PORT"; then
+    ok "memory"
+    curl -s --max-time 3 "http://127.0.0.1:$SERVE_PORT/api/status" 2>/dev/null \
+      | python3 -c 'import json,sys
+try:
+    s=json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+print("       %s memories · %s basins" % (s.get("cold_records"), s.get("basins")))' 2>/dev/null || true
+  else
+    off "memory     (sp start)"
+  fi
+  if embed_ok; then
+    ok "brain    (embed)"
+  else
+    off "brain    (sp embed up)"
+  fi
+  if basin_ok; then
+    ok "picture  http://127.0.0.1:$VIEWER_PORT/"
+  elif http_ok "$VIEWER_PORT"; then
+    off "picture  :$VIEWER_PORT is not Basin Field"
+  else
+    off "picture  (sp start)"
+  fi
+  if unit_exists "$UNIT_WATCH"; then
+    if unit_on "$UNIT_WATCH"; then
+      ok "ingest"
+    else
+      off "ingest"
+    fi
+  fi
+  say ""
+  note "sp start   to see it"
+}
+
+embed_up() {
+  if embed_ok; then
+    ok "brain already on"
+    return 0
+  fi
+  if have embedder; then
+    say "starting the memory brain (about a minute)…"
+    embedder up
+    return $?
+  fi
+  say "no embedder command — cannot start the brain"
+  note "install llama-server and the Qwen3 embedding GGUF"
+  return 1
+}
+
+embed_down() {
+  if have embedder; then
+    embedder down
+    return $?
+  fi
+  if have fuser; then
+    fuser -k "${EMBED_PORT}/tcp" >/dev/null 2>&1 || true
+  fi
+  off "brain"
+}
+
+serve_up() {
+  if api_ok "$SERVE_PORT"; then
+    ok "memory already on"
+    return 0
+  fi
+  if unit_exists "$UNIT_SERVE"; then
+    systemctl --user start "$UNIT_SERVE"
+    for _ in $(seq 40); do
+      api_ok "$SERVE_PORT" && { ok "memory"; return 0; }
+      sleep 0.5
+    done
+    off "memory failed — see journalctl --user -u $UNIT_SERVE"
+    return 1
+  fi
+  if [[ ! -x "$BIN" ]]; then
+    say "building SplatRAG (first time takes a few minutes)…"
+    (cd "$ENGINE" && cargo build --release) || return 1
+  fi
+  if [[ ! -f "$CONFIG" ]]; then
+    say "no config at $CONFIG"
+    return 1
+  fi
+  nohup "$BIN" --config "$CONFIG" serve \
+    >>"$LOG_DIR/serve.log" 2>&1 &
+  echo $! >"$LOG_DIR/serve.pid"
+  for _ in $(seq 40); do
+    api_ok "$SERVE_PORT" && { ok "memory"; return 0; }
+    sleep 0.5
+  done
+  off "memory failed — see $LOG_DIR/serve.log"
+  return 1
+}
+
+watch_up() {
+  unit_exists "$UNIT_WATCH" || return 0
+  systemctl --user start "$UNIT_WATCH" 2>/dev/null || true
+}
+
+viewer_up() {
+  if http_ok "$VIEWER_PORT"; then
+    if basin_ok; then
+      ok "picture already on"
+      return 0
+    fi
+    say ":$VIEWER_PORT is not Basin Field (need title SplatRAG v3)"
+    note "stop whatever is on that port, then: sp start"
+    return 1
+  fi
+  if [[ ! -f "$VIEWER/package.json" ]]; then
+    say "viewer folder missing: $VIEWER"
+    note "run:  bash $ENGINE/install.sh"
+    return 1
+  fi
+  if [[ ! -d "$VIEWER/node_modules" ]]; then
+    say "first-time viewer setup…"
+    (cd "$VIEWER" && npm install) || return 1
+  fi
+  say "opening the picture…"
+  (
+    cd "$VIEWER" || exit 1
+    export CHOKIDAR_USEPOLLING=1
+    export WATCHPACK_POLLING=1
+    nohup npm run dev >>"$LOG_DIR/viewer.log" 2>&1 &
+    echo $! >"$LOG_DIR/viewer.pid"
+  )
+  for _ in $(seq 60); do
+    if http_ok "$VIEWER_PORT"; then
+      if basin_ok; then
+        ok "picture  http://127.0.0.1:$VIEWER_PORT/"
+        return 0
+      fi
+      off "picture failed — :$VIEWER_PORT is not Basin Field"
+      return 1
+    fi
+    sleep 1
+  done
+  off "picture failed — see $LOG_DIR/viewer.log"
+  return 1
+}
+
+viewer_down() {
+  local pid=""
+  if [[ -f "$LOG_DIR/viewer.pid" ]]; then
+    pid=$(cat "$LOG_DIR/viewer.pid" 2>/dev/null || true)
+  fi
+  if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null || true
+    sleep 0.4
+    kill -9 "$pid" 2>/dev/null || true
+    rm -f "$LOG_DIR/viewer.pid"
+    off "picture"
+    return 0
+  fi
+  # Only poke :8080 if it looks like our viewer (not leftover palace).
+  if ! basin_ok; then
+    if http_ok "$VIEWER_PORT"; then
+      note ":$VIEWER_PORT is not Basin Field — left it alone"
+    else
+      note "picture already off"
+    fi
+    return 0
+  fi
+  if have fuser; then
+    fuser -k "${VIEWER_PORT}/tcp" >/dev/null 2>&1 || true
+  fi
+  off "picture"
+}
+
+open_picture() {
+  # cache-buster: Brave was holding a white blank from the old Google-fonts page
+  local url="http://127.0.0.1:$VIEWER_PORT/?v=3"
+  say ""
+  say "SplatRAG v3 is on."
+  say "  Look here:  $url"
+  say "  Title should say SplatRAG v3. Dark field, not white."
+  say "  If you still see white: close that tab, paste the link above in a new tab."
+  if [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]]; then
+    if have brave-browser; then
+      brave-browser --new-window "$url" >/dev/null 2>&1 || true
+    elif have xdg-open; then
+      xdg-open "$url" >/dev/null 2>&1 || true
+    fi
+  fi
+}
+
+cmd_start() {
+  say "Starting SplatRAG v3…"
+  say ""
+  embed_up || note "brain off — search will be weaker until: sp embed up"
+  serve_up || return 1
+  watch_up
+  viewer_up || return 1
+  open_picture
+}
+
+cmd_stop() {
+  viewer_down
+  say "picture off. memories are still saved."
+  note "sp start    to see it again"
+  note "sp embed down    if you also want the brain off"
+}
+
+main() {
+  local cmd="${1:-status}"
+  shift || true
+  case "$cmd" in
+    ""|status|st)     cmd_status ;;
+    start|on|see|up)  cmd_start ;;
+    stop|off)         cmd_stop ;;
+    embed)
+      case "${1:-status}" in
+        up|start|on)   embed_up ;;
+        down|stop|off) embed_down ;;
+        *)             embed_ok && ok "brain" || off "brain" ;;
+      esac
+      ;;
+    help|-h|--help)   cmd_help ;;
+    *)
+      say "I don't know '$cmd'."
+      say ""
+      cmd_help
+      return 1
+      ;;
+  esac
+}
+
+main "$@"

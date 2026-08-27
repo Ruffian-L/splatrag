@@ -19,6 +19,37 @@ viz/
 /splatrag.*.toml
 .env
 .env.*
+!.env.example
 .idea/
 .vscode/
 *.swp
+
+# Harness output. Stores, fetched corpora and logs live under the runtime dir;
+# receipts and frontend bundles are build products.
+/splatrag-runtime/
+/receipts/
+/dist/
+
+# Lab notes and measured dumps stay on the machine that ran them.
+/research/
+/.grok/
+.mcp.json
+.mcp.json.bak*
+
+# Local silos / machine paths — never ship
+/artifacts/
+/configs/personal.toml
+/configs/personal_dream_view.toml
+/configs/telemetry.toml
+/configs/docs.toml
+/configs/niodoo-telemetry.toml
+/configs/niodoo-telemetry-stripped.toml
+/ops/systemd/splatrag-personal-serve.service
+/scripts/mcp-for-grok.sh
+/scripts/mcp-for-silo.sh
+/scripts/verify_personal_doctor.sh
+/scripts/smoke_deneubourg.sh
+/scripts/smoke_easyway_whole.sh
+/scripts/smoke_friendship_hybrid.sh
+/scripts/ultima_mix.py
+/scripts/ultima_run.sh

@@ -1,10 +1,16 @@
 pub mod ann;
+pub mod basin_label;
 pub mod basin_score;
 pub mod cold_store;
 pub mod config;
+pub mod cuda_dream;
+pub mod dedupe;
+pub mod diagnose;
 pub mod embedding;
 pub mod eval;
 pub mod geometry;
+pub mod hotlock;
+pub mod hybrid;
 pub mod ingest;
 pub mod inversion;
 pub mod jlens;

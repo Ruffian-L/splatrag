@@ -48,15 +48,16 @@ impl SiloHub {
         let config = AppConfig::load(&path).map_err(|error| {
             (
                 -32603,
-                format!("failed to load silo {id} config {}: {error}", path.display()),
+                format!(
+                    "failed to load silo {id} config {}: {error}",
+                    path.display()
+                ),
             )
         })?;
-        let service = Arc::new(MemoryService::open(config).map_err(|error| {
-            (
-                -32603,
-                format!("failed to open silo {id}: {error}"),
-            )
-        })?);
+        let service = Arc::new(
+            MemoryService::open(config)
+                .map_err(|error| (-32603, format!("failed to open silo {id}: {error}")))?,
+        );
         self.cache
             .lock()
             .expect("silo cache")
@@ -82,12 +83,7 @@ fn normalize_silo(raw: &str) -> Result<String, (i32, String)> {
         "telemetry" | "dual-attention" => "telemetry".into(),
         "docs" | "research" => "docs".into(),
         other => {
-            return Err((
-                -32602,
-                format!(
-                    "unknown silo '{other}' (personal | niodoo-telemetry | telemetry | docs)"
-                ),
-            ));
+            return Err((-32602, format!("unknown silo '{other}'")));
         }
     })
 }
@@ -193,6 +189,13 @@ impl ProxyHub {
         self.current.read().expect("proxy current").clone()
     }
 
+    fn target_id(&self, requested: Option<&str>) -> Result<String, (i32, String)> {
+        match requested {
+            Some(raw) if !raw.trim().is_empty() => normalize_silo(raw),
+            _ => Ok(self.current_id()),
+        }
+    }
+
     fn switch(&self, raw: &str) -> Result<String, (i32, String)> {
         let id = normalize_silo(raw)?;
         *self.current.write().expect("proxy current") = id.clone();
@@ -200,10 +203,7 @@ impl ProxyHub {
     }
 
     fn url_for(&self, requested: Option<&str>) -> Result<String, (i32, String)> {
-        let id = match requested {
-            Some(raw) if !raw.trim().is_empty() => normalize_silo(raw)?,
-            _ => self.current_id(),
-        };
+        let id = self.target_id(requested)?;
         if id == self.default_id
             && let Ok(url) = std::env::var("SPLATRAG_API_URL")
         {
@@ -265,6 +265,67 @@ async fn proxy_tool(base: &str, name: &str, arguments: Value) -> Result<Value, (
     Ok(body)
 }
 
+async fn proxy_backend_up(base: &str) -> bool {
+    let url = format!("{}/api/status", base.trim_end_matches('/'));
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+    else {
+        return false;
+    };
+    client
+        .get(url)
+        .send()
+        .await
+        .is_ok_and(|response| response.status().is_success())
+}
+
+/// Start one long-lived HTTP store on first cross-silo access. The MCP gateway itself
+/// stays one process and every store shares the same CUDA embedder. This is opt-in so
+/// portable installs never assume systemd: set `SPLATRAG_SILO_UNIT_TEMPLATE` to a unit
+/// name containing `{}`, for example `splatrag-silo@{}.service`.
+async fn ensure_proxy_backend(id: &str, base: &str) -> Result<(), (i32, String)> {
+    if proxy_backend_up(base).await {
+        return Ok(());
+    }
+    let template = std::env::var("SPLATRAG_SILO_UNIT_TEMPLATE").map_err(|_| {
+        (
+            -32603,
+            format!(
+                "SplatRAG silo '{id}' is not serving at {base}; start its HTTP serve or set SPLATRAG_SILO_UNIT_TEMPLATE"
+            ),
+        )
+    })?;
+    if !template.contains("{}") {
+        return Err((
+            -32603,
+            "SPLATRAG_SILO_UNIT_TEMPLATE must contain {} for the silo id".into(),
+        ));
+    }
+    let unit = template.replace("{}", id);
+    let status = tokio::process::Command::new("systemctl")
+        .args(["--user", "start", &unit])
+        .status()
+        .await
+        .map_err(|error| (-32603, format!("failed to start {unit}: {error}")))?;
+    if !status.success() {
+        return Err((
+            -32603,
+            format!("systemctl could not start {unit} for silo '{id}'"),
+        ));
+    }
+    for _ in 0..120 {
+        if proxy_backend_up(base).await {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    Err((
+        -32603,
+        format!("{unit} started but silo '{id}' did not become ready at {base}"),
+    ))
+}
+
 /// Stdio MCP that does not open the store. Every mutating/search tool hits the
 /// long-lived `splatrag serve` process (one writer).
 pub async fn run_stdio_proxy() -> Result<()> {
@@ -293,7 +354,7 @@ pub async fn run_stdio_proxy() -> Result<()> {
             }
         };
         let is_notification = request.id.is_none();
-        if let Some(response) = handle_proxy(request, &hub).await
+        if let Some(response) = handle_proxy(request, &hub, false).await
             && !is_notification
         {
             write_response(&mut stdout, &response).await?;
@@ -302,17 +363,32 @@ pub async fn run_stdio_proxy() -> Result<()> {
     Ok(())
 }
 
-async fn handle_proxy(request: JsonRpcRequest, hub: &ProxyHub) -> Option<JsonRpcResponse> {
+async fn handle_proxy(
+    request: JsonRpcRequest,
+    hub: &ProxyHub,
+    shared_http: bool,
+) -> Option<JsonRpcResponse> {
     let id = request.id.unwrap_or(Value::Null);
     let result = match request.method.as_str() {
         "initialize" => Ok(json!({
             "protocolVersion": "2024-11-05",
             "serverInfo": {"name": "splatrag-memory", "version": env!("CARGO_PKG_VERSION")},
-            "capabilities": {"tools": {}}
+            "capabilities": {"tools": {}},
+            "instructions": if shared_http {
+                "One SplatRAG MCP server. If you run more than one store, pass silo= on each tool call. Do not register a separate MCP server per store."
+            } else {
+                "One SplatRAG MCP process. Pass silo= on a tool call to select a store other than this process's default."
+            }
         })),
         "notifications/initialized" | "initialized" => return None,
-        "tools/list" => Ok(tool_list()),
-        "tools/call" => proxy_call_tool(request.params.unwrap_or(Value::Null), hub).await,
+        "tools/list" => Ok(if shared_http {
+            shared_http_tool_list()
+        } else {
+            tool_list()
+        }),
+        "tools/call" => {
+            proxy_call_tool(request.params.unwrap_or(Value::Null), hub, !shared_http).await
+        }
         "ping" => Ok(json!({})),
         _ => Err((-32601, format!("method not found: {}", request.method))),
     };
@@ -332,7 +408,11 @@ async fn handle_proxy(request: JsonRpcRequest, hub: &ProxyHub) -> Option<JsonRpc
     })
 }
 
-async fn proxy_call_tool(params: Value, hub: &ProxyHub) -> Result<Value, (i32, String)> {
+async fn proxy_call_tool(
+    params: Value,
+    hub: &ProxyHub,
+    allow_switch: bool,
+) -> Result<Value, (i32, String)> {
     let name = params
         .get("name")
         .and_then(Value::as_str)
@@ -342,6 +422,13 @@ async fn proxy_call_tool(params: Value, hub: &ProxyHub) -> Result<Value, (i32, S
         .cloned()
         .unwrap_or_else(|| json!({}));
     if name == "switch_silo" {
+        if !allow_switch {
+            return Err((
+                -32602,
+                "switch_silo is disabled on the shared HTTP gateway; pass silo= on each call"
+                    .into(),
+            ));
+        }
         let silo = arguments
             .get("silo")
             .and_then(Value::as_str)
@@ -365,9 +452,35 @@ async fn proxy_call_tool(params: Value, hub: &ProxyHub) -> Result<Value, (i32, S
         }));
     }
     let requested = arguments.get("silo").and_then(Value::as_str);
-    let base = hub.url_for(requested)?;
+    let id = hub.target_id(requested)?;
+    let base = hub.url_for(Some(&id))?;
+    ensure_proxy_backend(&id, &base).await?;
     let value = proxy_tool(&base, name, arguments).await?;
     wrap_tool_result(value)
+}
+
+fn shared_http_tool_list() -> Value {
+    let mut list = tool_list();
+    if let Some(tools) = list.get_mut("tools").and_then(Value::as_array_mut) {
+        tools.retain(|tool| tool.get("name").and_then(Value::as_str) != Some("switch_silo"));
+    }
+    list
+}
+
+/// Stateless MCP Streamable HTTP request handler. No session-global silo exists here because
+/// many Codex/Claude/Grok clients share this endpoint; callers select a store with `silo=`.
+pub async fn handle_streamable_http(body: Value) -> Result<Option<Value>, (i32, String)> {
+    let request = serde_json::from_value::<JsonRpcRequest>(body)
+        .map_err(|error| (-32700, format!("invalid JSON-RPC request: {error}")))?;
+    let is_notification = request.id.is_none();
+    let hub = ProxyHub::from_env()?;
+    let response = handle_proxy(request, &hub, true).await;
+    if is_notification || response.is_none() {
+        return Ok(None);
+    }
+    serde_json::to_value(response.expect("checked above"))
+        .map(Some)
+        .map_err(internal_error)
 }
 
 pub async fn run_stdio(service: Arc<MemoryService>) -> Result<()> {
@@ -436,10 +549,7 @@ async fn handle(request: JsonRpcRequest, hub: &SiloHub) -> Option<JsonRpcRespons
 }
 
 async fn call_tool_on_hub(params: Value, hub: &SiloHub) -> Result<Value, (i32, String)> {
-    let name = params
-        .get("name")
-        .and_then(Value::as_str)
-        .unwrap_or("");
+    let name = params.get("name").and_then(Value::as_str).unwrap_or("");
     let arguments = params
         .get("arguments")
         .cloned()
@@ -626,7 +736,8 @@ pub(crate) async fn call_tool_raw(
             let gain_budget = arguments
                 .get("budget")
                 .and_then(Value::as_f64)
-                .unwrap_or(crate::pick::DEFAULT_GAIN_BUDGET as f64) as f32;
+                .unwrap_or(crate::pick::DEFAULT_GAIN_BUDGET as f64)
+                as f32;
             let filters: RecallFilters = arguments
                 .get("filters")
                 .cloned()
@@ -826,7 +937,7 @@ pub(crate) fn tool_list() -> Value {
                         "speaker": {"type": "string"},
                         "model": {"type": "string"},
                         "conversation_id": {"type": "string"},
-                        "silo": {"type": "string", "description": "personal | niodoo-telemetry | telemetry | docs. Default: current silo."}
+                        "silo": {"type": "string", "description": "Optional store name. Default: this process's config."}
                     },
                     "required": ["text"]
                 }
@@ -842,7 +953,7 @@ pub(crate) fn tool_list() -> Value {
                         "budget": {"type": "number", "description": "Total α shared across picks. Default 0.35."},
                         "min_score": {"type": "number"},
                         "text_budget": {"type": "integer", "description": "Inspect preview chars only. Default 240. Not the payload."},
-                        "hybrid": {"type": "boolean", "description": "Ant-slime rerank. ORed with config [pick] hybrid. Personal default off."},
+                        "hybrid": {"type": "boolean", "description": "Hybrid rerank. Combined with config [pick] hybrid."},
                         "track_usage": {"type": "boolean", "description": "Increment splat.usage on the chosen pick. ORed with config."},
                         "hybrid_beta": {"type": "number", "description": "Hybrid β. Argument if set, else config [pick] hybrid_beta (default 2)."},
                         "easyway": {"type": "boolean", "description": "Collapse high I_R τ this cycle. ORed with config."},
@@ -933,12 +1044,12 @@ pub(crate) fn tool_list() -> Value {
             },
             {
                 "name": "recall",
-                "description": "Search Jason's SplatRAG memory (chats, decisions, exports). Prefer this BEFORE large filesystem greps/finds about history, naming, past work, or what Jason meant. Hybrid BM25 + HNSW + radiance. Returns turns with speaker, conversation_id, timestamps, full text. If it fails, call ensure_ready then retry — do not report 'down' without trying that.",
+                "description": "Search the local SplatRAG store. Hybrid BM25 + HNSW. Returns turns with speaker, conversation_id, timestamps, and full text. If it fails, call ensure_ready then retry.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "query": {"type": "string"},
-                        "silo": {"type": "string", "description": "personal | niodoo-telemetry | telemetry | docs"},
+                        "silo": {"type": "string", "description": "Optional store name. Default: this process's config."},
                         "limit": {"type": "integer", "minimum": 1, "maximum": 100},
                         "filters": {
                             "type": "object",
@@ -973,7 +1084,7 @@ pub(crate) fn tool_list() -> Value {
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "silo": {"type": "string", "description": "personal | niodoo-telemetry | telemetry | docs"}
+                        "silo": {"type": "string", "description": "Optional store name. Default: this process's config."}
                     },
                     "required": ["silo"]
                 }
@@ -1041,11 +1152,8 @@ fn list_silos(service: &MemoryService, hub: Option<&SiloHub>) -> Value {
 fn load_silo_catalog() -> Value {
     let candidates = [
         std::env::var_os("SPLATRAG_SILOS").map(std::path::PathBuf::from),
-        std::env::var_os("SPLATRAG_ROOT").map(|root| {
-            std::path::Path::new(&root)
-                .join("..")
-                .join("silos.json")
-        }),
+        std::env::var_os("SPLATRAG_ROOT")
+            .map(|root| std::path::Path::new(&root).join("..").join("silos.json")),
         Some(std::path::PathBuf::from(
             "/home/ruffianl/Hub/Projects/splatrag/silos.json",
         )),
@@ -1062,27 +1170,9 @@ fn load_silo_catalog() -> Value {
     }
     json!([
         {
-            "id": "personal",
+            "id": "default",
             "scope_key": "splatrag-main",
-            "role": "Chats, decisions, exports. Default agent memory.",
-            "mcp": "splatrag"
-        },
-        {
-            "id": "niodoo-telemetry",
-            "scope_key": "splatrag-niodoo-telemetry",
-            "role": "Full-line niodoo force/run telemetry.",
-            "mcp": "splatrag"
-        },
-        {
-            "id": "telemetry",
-            "scope_key": "splatrag-telemetry",
-            "role": "Dual-attention / dual-stream-soul summaries.",
-            "mcp": "splatrag"
-        },
-        {
-            "id": "docs",
-            "scope_key": "splatrag-docs",
-            "role": "Research notes, north star, evals, build receipts.",
+            "role": "This process's memory store.",
             "mcp": "splatrag"
         }
     ])
@@ -1176,5 +1266,60 @@ mod tests {
         assert!(pick_config_from_args(&empty, &config.pick, 3, 0.0, 240, 0.35).hybrid);
         config.pick.hybrid = false;
         assert!(!pick_config_from_args(&empty, &config.pick, 3, 0.0, 240, 0.35).hybrid);
+    }
+
+    #[tokio::test]
+    async fn shared_http_initializes_without_a_session_process() {
+        let response = handle_streamable_http(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "test", "version": "1"}
+            }
+        }))
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(response["result"]["protocolVersion"], "2024-11-05");
+        assert!(
+            response["result"]["instructions"]
+                .as_str()
+                .unwrap()
+                .contains("One shared SplatRAG MCP gateway")
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_http_lists_one_cross_silo_surface_without_switch_state() {
+        let response = handle_streamable_http(json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {}
+        }))
+        .await
+        .unwrap()
+        .unwrap();
+        let tools = response["result"]["tools"].as_array().unwrap();
+        assert!(tools.iter().any(|tool| tool["name"] == "recall"));
+        assert!(tools.iter().any(|tool| tool["name"] == "list_silos"));
+        assert!(!tools.iter().any(|tool| tool["name"] == "switch_silo"));
+        let recall = tools.iter().find(|tool| tool["name"] == "recall").unwrap();
+        assert!(recall["inputSchema"]["properties"].get("silo").is_some());
+    }
+
+    #[tokio::test]
+    async fn shared_http_accepts_initialized_notification_without_a_body() {
+        let response = handle_streamable_http(json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+            "params": {}
+        }))
+        .await
+        .unwrap();
+        assert!(response.is_none());
     }
 }

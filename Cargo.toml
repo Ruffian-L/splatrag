@@ -1,6 +1,6 @@
 [package]
 name = "splatrag"
-version = "0.1.0"
+version = "3.0.0"
 edition = "2024"
 description = "Local Gaussian-splat AI memory store: append-only cold log, BM25 + HNSW hybrid retrieval, a splat field that repels noise instead of deleting it, and a picker that decides which memory steers a live model and how hard."
 license = "MIT"

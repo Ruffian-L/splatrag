@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  rust:
+    name: fmt · clippy · test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test
+
+      # The retrieval tests run offline against fixtures. The full benchmark needs an 8 GB
+      # embedding model and about an hour on a GPU, so it is not a CI job — ./claim.sh runs
+      # it locally and writes a receipt. This step only proves the harness is not broken.
+      - name: Harness smoke
+        run: |
+          ./scripts/preflight.sh || true   # llama-server and the model are absent on CI
+          ./claim.sh --help >/dev/null
+          ./run --help >/dev/null
+          ./scripts/fetch_datasets.sh --verify 2>&1 | tail -5 || true
+          python3 -c "import json; json.load(open('research_logs/2026-08-04_handshake_repro.json'))"
+          python3 -c "from pathlib import Path; t=Path('research_logs/2026-08-04_bench_repro_honest.txt').read_text(); assert '0.6664' in t"
+          ./scripts/verdict.py research_logs/2026-08-04_handshake_repro.json
+
+  shell:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lint shell
+        run: |
+          sudo apt-get update && sudo apt-get install -y shellcheck
+          shellcheck -e SC1091 run start.sh claim.sh \
+            scripts/lib.sh scripts/fetch_datasets.sh scripts/preflight.sh \
+            scripts/embed-for-splatrag.sh scripts/sp install.sh

@@ -1,0 +1,18 @@
+[Unit]
+Description=SplatRAG embedding server (llama-server)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Point these at your checkout and GGUF. Do not commit a filled-in copy.
+Environment=SPLATRAG_EMBED_MODEL=/path/to/Qwen3-Embedding-8B-Q8_0.gguf
+WorkingDirectory=/path/to/splatrag
+ExecStart=/path/to/splatrag/scripts/embed-for-splatrag.sh
+Restart=always
+RestartSec=5
+TimeoutStartSec=180
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

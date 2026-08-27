@@ -1,8 +1,11 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use splatrag::diagnose::basin_component_curve;
 use splatrag::eval::{
-    MAX_RECALL_DROP, classify_scifact_misses, evaluate_scifact, flip_query,
+    MAX_RECALL_DROP, classify_scifact_misses, evaluate_scifact, evaluate_scifact_roles,
+    evaluate_scifact_ultima, flip_query,
 };
+use splatrag::geometry::HotState;
 use splatrag::ingest::{IngestReport, Ingestor, SourceKind};
 use splatrag::record::{MemoryRecord, RecallFilters};
 use splatrag::{AppConfig, MemoryService};
@@ -67,11 +70,21 @@ enum Command {
         #[arg(long)]
         source_key: Option<String>,
     },
-    /// Steer one existing splat. Gain inverts/amplifies semantics; mass repels if negative.
-    /// These are independent: `gain=-0.2` does not set negative mass.
+    /// Steer addresses. One id (legacy) or N `--memory` / `--basin` under one `--budget`.
+    /// Gain inverts/amplifies semantics; mass repels if negative. Independent knobs.
     /// Axis defaults to auto (basin peers / field mean) so α actually controls rotation.
+    /// A `--basin` with no `--memory` steers the room 64-d (member mean), not member 0.
     Steer {
-        memory_id: String,
+        memory_id: Option<String>,
+        /// Repeatable pin addresses. One call, one budget.
+        #[arg(long = "memory", value_name = "UUID")]
+        memories: Vec<String>,
+        /// Repeatable room addresses. 64-d = member mean, not member 0.
+        #[arg(long = "basin", value_name = "ID")]
+        basins: Vec<String>,
+        /// Total |α| to split across addresses. Default: |gain|. One cap, not N caps.
+        #[arg(long, allow_hyphen_values = true)]
+        budget: Option<f32>,
         /// Negative = ontological inversion; positive = amplify. Default 0 = leave semantics.
         #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
         gain: f32,
@@ -81,9 +94,11 @@ enum Command {
         /// If set, overwrite mass. Negative mass repels in dream.
         #[arg(long, allow_hyphen_values = true)]
         mass: Option<f32>,
-        #[arg(long)]
-        basin: Option<String>,
-        #[arg(long)]
+        /// Write this basin id onto a pin. Not a room steer — use `--basin` for that.
+        #[arg(long = "assign-basin")]
+        assign_basin: Option<String>,
+        /// Lock pin membership. Same SteerOpts on `--memory` / `--basin`; not a room lock.
+        #[arg(long, default_value_t = false)]
         lock: bool,
         /// Concept axis: auto (default) | self | field | basin
         #[arg(long, default_value = "auto")]
@@ -116,7 +131,7 @@ enum Command {
         /// Only this archive: claude | grok-export | gemini | claude-memory. Repeatable.
         #[arg(long)]
         source: Vec<String>,
-        /// Only this speaker: human | assistant. Repeatable.
+        /// Only this speaker: human | collaborator. Repeatable.
         #[arg(long)]
         speaker: Vec<String>,
         #[arg(long)]
@@ -128,8 +143,8 @@ enum Command {
     },
     /// Pick memories to steer a live model toward, with the knobs to apply them.
     ///
-    /// Writes a pick set carrying each memory's **text** — the consumer embeds it with its own
-    /// encoder. `semantics_64` is telemetry; it is not injectable into another model's residual.
+    /// Writes a pick set of **addresses** (`memory_id` + basin). `inspect` is a short preview.
+    /// `semantics_64` is telemetry; it is not injectable. Do not embed `inspect` into a residual.
     Pick {
         prompt: String,
         #[arg(long, default_value_t = 3)]
@@ -137,20 +152,35 @@ enum Command {
         /// Drop candidates scoring below this.
         #[arg(long, default_value_t = 0.0)]
         min_score: f32,
-        /// Characters of memory text per pick.
-        #[arg(long, default_value_t = splatrag::pick::DEFAULT_TEXT_BUDGET)]
+        /// Characters of inspect preview per pick. Not the injection payload.
+        #[arg(long, default_value_t = splatrag::pick::DEFAULT_INSPECT_CHARS)]
         text_budget: usize,
         /// Total steering α shared across all picks — divided, not paid per pick. Sweep this
         /// against --limit to separate "more memories" from "more total push".
         #[arg(long, default_value_t = splatrag::pick::DEFAULT_GAIN_BUDGET)]
         budget: f32,
+        /// Re-rank the pick pool with hybrid scoring. Also settable in config `[pick] hybrid`.
+        #[arg(long, default_value_t = false)]
+        hybrid: bool,
+        /// Force hybrid off even if the config silo defaults it on.
+        #[arg(long, default_value_t = false)]
+        no_hybrid: bool,
+        /// Scratch-store only. Increment splat.usage on the chosen pick. Not radiance.
+        #[arg(long, default_value_t = false)]
+        track_usage: bool,
+        /// Hybrid β. Default 2 = meaning fights leftover usage. 0 = habit only.
+        #[arg(long, default_value_t = 2.0)]
+        hybrid_beta: f32,
+        /// Collapse high usage this cycle. Off by default.
+        #[arg(long, default_value_t = false)]
+        easyway: bool,
         #[arg(long)]
         domain: Vec<String>,
         /// Only this archive: claude | grok-export | gemini | claude-memory. Repeatable.
         /// Keeps both sides of the conversation — a source is a relationship, not a speaker.
         #[arg(long)]
         source: Vec<String>,
-        /// Only this speaker: human | assistant. Repeatable. This one drops the other party.
+        /// Only this speaker: human | collaborator. Repeatable. This one drops the other party.
         #[arg(long)]
         speaker: Vec<String>,
         #[arg(long)]
@@ -163,7 +193,13 @@ enum Command {
         #[arg(long)]
         label: bool,
     },
-    LabelBasins,
+    /// Name basins with the local labeler (Gemma on :8082).
+    /// Uses meaning-scored sample texts so junk clusters name as junk and themes surface.
+    LabelBasins {
+        /// Re-label basins that already have stable names.
+        #[arg(long)]
+        force: bool,
+    },
     ListBasins,
     BrowseBasin {
         basin_id: String,
@@ -176,6 +212,23 @@ enum Command {
     Mcp,
     Serve,
     RebuildIndex,
+    /// Rebuild the BM25 (tantivy) index from cold without touching HNSW or dream/hot state.
+    CompactLexical,
+    /// Embed cold records missing from HNSW/hot. Does not wipe dream geometry.
+    BackfillDerived,
+    /// Copy 64-d vectors already on hot splats into HNSW. No embedder.
+    HydrateAnn,
+    /// Open-domain SciFact: poison/chat may occupy top-k. Reports delta vs the filtered 0.8804 freeze.
+    Ultima {
+        #[arg(long, default_value = "datasets/scifact")]
+        dataset: PathBuf,
+        #[arg(long, default_value_t = 10)]
+        k: usize,
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// BM25 vs dense vs rank miss taxonomy on SciFact (or free-text --query flip).
     MissClassify {
         #[arg(long, default_value = "datasets/scifact")]
@@ -204,12 +257,39 @@ enum Command {
         dataset: PathBuf,
         #[arg(long)]
         poison: Option<PathBuf>,
+        /// Domain the poison corpus is stored under. Cross-domain repulsion keys on this, so a
+        /// corpus that is not Urban Dictionary should say so rather than borrow its label.
+        #[arg(long, default_value = "urban")]
+        poison_domain: String,
         #[arg(long, default_value_t = 10)]
         k: usize,
         #[arg(long)]
         limit: Option<usize>,
         #[arg(long)]
         no_ingest: bool,
+    },
+    /// Threshold → largest connected component in 64-d and in the 3-d picture.
+    /// Does not change clustering.
+    DiagnoseBasin {
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// 64-d shortlist vs 4096-d rerank vs BM25+64-d / BM25+4096-d / three-arm RRF.
+    /// Does not change ranking.
+    DiagnoseRoles {
+        #[arg(long, default_value = "datasets/scifact")]
+        dataset: PathBuf,
+        #[arg(long, default_value_t = 10)]
+        k: usize,
+        #[arg(long, default_value_t = 80)]
+        cand: usize,
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Skip exact 64-d brute-force vs HNSW (cheap on SciFact-scale stores).
+        #[arg(long, default_value_t = false)]
+        skip_exact: bool,
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
 }
 
@@ -239,8 +319,7 @@ async fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 let service = Arc::new(MemoryService::open(config.clone())?);
-                let (report, appended) =
-                    ingest_indexed(&config, service, source, path, domain, true).await?;
+                let (report, appended) = service.ingest_path(source, path, domain).await?;
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
@@ -275,7 +354,7 @@ async fn main() -> Result<()> {
             });
             let mut record = MemoryRecord::new(source, key, text);
             record.domain = domain;
-            record.speaker = speaker;
+            record.speaker = splatrag::record::clean_speaker(speaker);
             record.model = model;
             record.conversation_id = conversation;
             println!(
@@ -285,28 +364,37 @@ async fn main() -> Result<()> {
         }
         Command::Steer {
             memory_id,
+            memories,
+            basins,
+            budget,
             gain,
             op,
             mass,
-            basin,
+            assign_basin,
             lock,
             axis,
         } => {
             let service = MemoryService::open(config)?;
-            let id = uuid::Uuid::parse_str(&memory_id)
-                .with_context(|| format!("invalid memory id {memory_id}"))?;
-            let opts = splatrag::service::SteerOpts {
-                gain,
-                op: splatrag::inversion::InversionOp::parse(&op)?,
-                mass,
-                basin_id: basin,
-                basin_locked: lock,
-                axis: splatrag::inversion::SteerAxisMode::parse(&axis)?,
-            };
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&service.steer(id, opts).await?)?
-            );
+            let opts = steer_opts_from_flags(gain, &op, mass, assign_basin, lock, &axis)?;
+            let batch = !memories.is_empty() || !basins.is_empty();
+            if !batch {
+                let id_str = memory_id.context("steer needs a memory id, or --memory / --basin")?;
+                let id = uuid::Uuid::parse_str(&id_str)
+                    .with_context(|| format!("invalid memory id {id_str}"))?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&service.steer(id, opts).await?)?
+                );
+            } else {
+                let addresses = steer_addresses_from_cli(memory_id, memories, basins)?;
+                let budget = budget.unwrap_or(gain.abs());
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &service.steer_addresses(addresses, opts, budget).await?
+                    )?
+                );
+            }
         }
         Command::Pack64 {
             memory_id,
@@ -347,11 +435,11 @@ async fn main() -> Result<()> {
                 .context("invalid --memory-id")?;
             println!(
                 "{}",
-                serde_json::to_string_pretty(&service.unpack_packet(
-                    &packet,
-                    cb.as_ref(),
-                    override_id
-                )?)?
+                serde_json::to_string_pretty(
+                    &service
+                        .unpack_packet(&packet, cb.as_ref(), override_id)
+                        .await?
+                )?
             );
         }
         Command::Recall {
@@ -385,6 +473,11 @@ async fn main() -> Result<()> {
             min_score,
             text_budget,
             budget,
+            hybrid,
+            no_hybrid,
+            track_usage,
+            hybrid_beta,
+            easyway,
             domain,
             source,
             speaker,
@@ -404,6 +497,14 @@ async fn main() -> Result<()> {
                 min_score,
                 text_budget,
                 gain_budget: budget,
+                hybrid: if no_hybrid {
+                    false
+                } else {
+                    hybrid || service.config.pick.hybrid
+                },
+                track_usage: track_usage || service.config.pick.track_usage,
+                hybrid_beta,
+                easyway: easyway || service.config.pick.easyway,
             };
             let picks = service.pick(&prompt, &filters, &pick_config).await?;
             let json = serde_json::to_string_pretty(&picks)?;
@@ -437,9 +538,11 @@ async fn main() -> Result<()> {
                 }))?
             );
         }
-        Command::LabelBasins => {
+        Command::LabelBasins { force } => {
             let service = MemoryService::open(config)?;
-            println!("{}", service.label_basins().await?);
+            let n = service.label_basins_with_options(force).await?;
+            eprintln!("labeled {n} basins{}", if force { " (force)" } else { "" });
+            println!("{n}");
         }
         Command::ListBasins => {
             let service = MemoryService::open(config)?;
@@ -471,13 +574,71 @@ async fn main() -> Result<()> {
             );
         }
         Command::Mcp => {
-            splatrag::mcp::run_stdio(Arc::new(MemoryService::open(config)?)).await?;
+            if std::env::var_os("SPLATRAG_API_URL").is_some() {
+                splatrag::mcp::run_stdio_proxy().await?;
+            } else {
+                splatrag::mcp::run_stdio(Arc::new(MemoryService::open(config)?)).await?;
+            }
         }
         Command::Serve => {
             splatrag::web::serve(Arc::new(MemoryService::open(config)?)).await?;
         }
         Command::RebuildIndex => {
             rebuild_indices(config).await?;
+        }
+        Command::CompactLexical => {
+            compact_lexical(config)?;
+        }
+        Command::BackfillDerived => {
+            let service = MemoryService::open(config)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&service.backfill_missing_derived().await?)?
+            );
+        }
+        Command::HydrateAnn => {
+            let service = MemoryService::open(config)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&service.hydrate_ann_from_hot().await?)?
+            );
+        }
+        Command::Ultima {
+            dataset,
+            k,
+            limit,
+            out,
+        } => {
+            let service = MemoryService::open(config)?;
+            let report = evaluate_scifact_ultima(&service, &dataset, k, limit).await?;
+            let summary = serde_json::json!({
+                "queries": report.queries,
+                "k": report.k,
+                "recall_at_k": report.recall_at_k,
+                "ndcg_at_k": report.ndcg_at_k,
+                "published_filtered_recall": report.published_filtered_recall,
+                "published_filtered_ndcg": report.published_filtered_ndcg,
+                "delta_recall": report.delta_recall,
+                "delta_ndcg": report.delta_ndcg,
+                "mean_slots_non_scifact": report.mean_slots_non_scifact,
+                "mean_slots_chat": report.mean_slots_chat,
+                "mean_slots_urban": report.mean_slots_urban,
+                "mean_slots_bm25_only": report.mean_slots_bm25_only,
+                "mean_slots_dense_only": report.mean_slots_dense_only,
+                "mean_slots_both_arms": report.mean_slots_both_arms,
+                "mean_near_dup_slots": report.mean_near_dup_slots,
+                "queries_with_displacement": report.queries_with_displacement,
+                "queries_with_near_dup": report.queries_with_near_dup,
+                "open_domain": report.open_domain,
+            });
+            eprintln!("{}", serde_json::to_string_pretty(&summary)?);
+            let text = serde_json::to_string_pretty(&report)?;
+            if let Some(path) = out {
+                std::fs::write(&path, &text)
+                    .with_context(|| format!("write {}", path.display()))?;
+                eprintln!("ultima report → {}", path.display());
+            }
+            println!("{}", serde_json::to_string_pretty(&summary)?);
         }
         Command::MissClassify {
             dataset,
@@ -499,8 +660,7 @@ async fn main() -> Result<()> {
                     .filter(|s| !s.is_empty())
                     .map(|s| (s.to_string(), 1u32))
                     .collect();
-                let report =
-                    flip_query(&service, &q, k, cand, &golds, domain.as_deref()).await?;
+                let report = flip_query(&service, &q, k, cand, &golds, domain.as_deref()).await?;
                 let text = serde_json::to_string_pretty(&report)?;
                 if let Some(path) = out {
                     std::fs::write(&path, &text)
@@ -509,8 +669,7 @@ async fn main() -> Result<()> {
                 }
                 println!("{text}");
             } else {
-                let report =
-                    classify_scifact_misses(&service, &dataset, k, cand, limit).await?;
+                let report = classify_scifact_misses(&service, &dataset, k, cand, limit).await?;
                 let summary = serde_json::json!({
                     "queries": report.queries,
                     "failing_queries": report.failing_queries,
@@ -534,28 +693,123 @@ async fn main() -> Result<()> {
         Command::Handshake {
             dataset,
             poison,
+            poison_domain,
             k,
             limit,
             no_ingest,
         } => {
-            run_handshake(config, dataset, poison, k, limit, no_ingest).await?;
+            run_handshake(config, dataset, poison, poison_domain, k, limit, no_ingest).await?;
+        }
+        Command::DiagnoseBasin { out } => {
+            let hot = HotState::load(&config.hot_state_path())?;
+            eprintln!(
+                "basin curve on {} live splats (cycle {})",
+                hot.splats.iter().filter(|s| !s.muted).count(),
+                hot.dream_cycle
+            );
+            let report = basin_component_curve(&hot);
+            let text = serde_json::to_string_pretty(&report)?;
+            if let Some(path) = out {
+                std::fs::write(&path, &text)
+                    .with_context(|| format!("write {}", path.display()))?;
+                eprintln!("basin curve → {}", path.display());
+            }
+            println!("{text}");
+        }
+        Command::DiagnoseRoles {
+            dataset,
+            k,
+            cand,
+            limit,
+            skip_exact,
+            out,
+        } => {
+            let service = MemoryService::open(config)?;
+            let report =
+                evaluate_scifact_roles(&service, &dataset, k, cand, limit, !skip_exact).await?;
+            let text = serde_json::to_string_pretty(&report)?;
+            eprintln!("{text}");
+            if let Some(path) = out {
+                std::fs::write(&path, &text)
+                    .with_context(|| format!("write {}", path.display()))?;
+                eprintln!("roles report → {}", path.display());
+            }
+            println!("{text}");
         }
     }
     Ok(())
 }
 
-/// Default niodv4 juice codebook (256 × 64, PUA transport). Override with --codebook.
-const DEFAULT_CODEBOOK: &str = "";
+/// `--lock` / `--assign-basin` belong on SteerOpts, not on `--basin` room addresses.
+fn steer_opts_from_flags(
+    gain: f32,
+    op: &str,
+    mass: Option<f32>,
+    assign_basin: Option<String>,
+    lock: bool,
+    axis: &str,
+) -> Result<splatrag::service::SteerOpts> {
+    Ok(splatrag::service::SteerOpts {
+        gain,
+        op: splatrag::inversion::InversionOp::parse(op)?,
+        mass,
+        basin_id: assign_basin,
+        basin_locked: lock,
+        axis: splatrag::inversion::SteerAxisMode::parse(axis)?,
+    })
+}
 
+fn steer_addresses_from_cli(
+    memory_id: Option<String>,
+    memories: Vec<String>,
+    basins: Vec<String>,
+) -> Result<Vec<splatrag::service::SteerAddress>> {
+    let mut addresses = Vec::new();
+    if let Some(id_str) = memory_id {
+        let id = uuid::Uuid::parse_str(&id_str)
+            .with_context(|| format!("invalid memory id {id_str}"))?;
+        addresses.push(splatrag::service::SteerAddress {
+            memory_id: Some(id),
+            basin_id: None,
+            share: None,
+        });
+    }
+    for raw in memories {
+        let id = uuid::Uuid::parse_str(&raw).with_context(|| format!("invalid --memory {raw}"))?;
+        addresses.push(splatrag::service::SteerAddress {
+            memory_id: Some(id),
+            basin_id: None,
+            share: None,
+        });
+    }
+    for raw in basins {
+        addresses.push(splatrag::service::SteerAddress {
+            memory_id: None,
+            basin_id: Some(raw),
+            share: None,
+        });
+    }
+    Ok(addresses)
+}
+
+/// Resolve the niodv4 VQ codebook (256 × 64, PUA transport) for packet unicode.
+///
+/// `--codebook` wins, then `SPLATRAG_CODEBOOK`. There is no built-in default: the codebook is
+/// not distributed with this repo, so asking for unicode without one is a mistake worth naming
+/// rather than a file-not-found on an empty path.
 fn load_codebook(
     path: Option<PathBuf>,
     want: bool,
 ) -> Result<Option<splatrag::packet::VqCodebook>> {
-    if !want && path.is_none() {
-        return Ok(None);
+    let path = path.or_else(|| std::env::var_os("SPLATRAG_CODEBOOK").map(PathBuf::from));
+    match path {
+        Some(path) => Ok(Some(splatrag::packet::VqCodebook::load_json(&path)?)),
+        None if want => anyhow::bail!(
+            "VQ unicode needs a codebook: pass --codebook <codebook_256.json> \
+             or set SPLATRAG_CODEBOOK"
+        ),
+        None => Ok(None),
     }
-    let path = path.unwrap_or_else(|| PathBuf::from(DEFAULT_CODEBOOK));
-    Ok(Some(splatrag::packet::VqCodebook::load_json(&path)?))
 }
 
 /// OCR pass for export assets. Separate from ingest: long-running, resumable.
@@ -566,7 +820,7 @@ async fn run_extract(
     limit: Option<usize>,
 ) -> Result<()> {
     use splatrag::embedding::LabelingClient;
-    use splatrag::ingest::extract::{self, MediaKind, OcrCache};
+    use splatrag::ingest::extract::{self, OcrCache};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Semaphore;
 
@@ -660,52 +914,25 @@ async fn run_extract(
         newly.load(Ordering::Relaxed),
         cache.len()
     );
-    // Silence unused import if MediaKind only used via kind
-    let _ = MediaKind::Png;
     Ok(())
 }
 
 async fn ingest_indexed(
-    config: &AppConfig,
+    _config: &AppConfig,
     service: Arc<MemoryService>,
     source: SourceKind,
     path: PathBuf,
     domain: String,
-    progress: bool,
+    _progress: bool,
 ) -> Result<(IngestReport, usize)> {
-    let (sender, mut receiver) = tokio::sync::mpsc::channel(256);
-    let quarantine = config.quarantine_path();
-    let parser = tokio::task::spawn_blocking(move || {
-        Ingestor::new(quarantine).ingest_path(source, &path, &domain, |record| {
-            sender
-                .blocking_send(record)
-                .context("ingest receiver closed")
-        })
-    });
-    let mut batch = Vec::new();
-    let mut appended = 0;
-    while let Some(record) = receiver.recv().await {
-        batch.push(record);
-        if batch.len() >= config.embedding.batch_size {
-            appended += service
-                .remember_batch(std::mem::take(&mut batch))
-                .await?
-                .appended;
-            if progress {
-                eprintln!("indexed {appended} new memories");
-            }
-        }
-    }
-    if !batch.is_empty() {
-        appended += service.remember_batch(batch).await?.appended;
-    }
-    Ok((parser.await??, appended))
+    service.ingest_path(source, path, domain).await
 }
 
 async fn run_handshake(
     config: AppConfig,
     dataset: PathBuf,
     poison: Option<PathBuf>,
+    poison_domain: String,
     k: usize,
     limit: Option<usize>,
     no_ingest: bool,
@@ -740,12 +967,14 @@ async fn run_handshake(
     let mut cold_preserved = None;
     let mut dream_summary = None;
     if let Some(poison_path) = poison {
+        // Domain is CLI-controlled (`--poison-domain`, default urban) so cross-domain
+        // repulsion keys on the same string the claim receipts report.
         let (report, appended) = ingest_indexed(
             &config,
             Arc::clone(&service),
             SourceKind::Auto,
             poison_path,
-            "urban".into(),
+            poison_domain.clone(),
             true,
         )
         .await?;
@@ -782,6 +1011,7 @@ async fn run_handshake(
         "baseline": baseline,
         "poison_ingest": poison_ingest,
         "poison_appended": poison_appended,
+        "poison_domain": poison_domain,
         "dream": dream_summary,
         "after_poison": after_poison,
         "recall_drop": recall_drop,
@@ -804,6 +1034,41 @@ async fn run_handshake(
     Ok(())
 }
 
+fn compact_lexical(config: AppConfig) -> Result<()> {
+    let cold = splatrag::cold_store::ColdStore::open(config.cold_path())?;
+    let records = cold.load_all()?;
+    let dest = config.lexical_path();
+    let parent = dest
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("lexical path has no parent: {}", dest.display()))?;
+    let tmp = parent.join("tantivy.new");
+    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+    let backup = parent.join(format!("tantivy.old-{stamp}"));
+    if tmp.exists() {
+        std::fs::remove_dir_all(&tmp)?;
+    }
+    eprintln!(
+        "compacting lexical index: {} records → {}",
+        records.len(),
+        tmp.display()
+    );
+    let built = splatrag::lexical::LexicalIndex::rebuild(&tmp, records)?;
+    drop(built);
+    if dest.exists() {
+        std::fs::rename(&dest, &backup)?;
+    }
+    std::fs::rename(&tmp, &dest)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "scope_key": config.scope_key,
+            "lexical": dest,
+            "previous": backup,
+        }))?
+    );
+    Ok(())
+}
+
 async fn rebuild_indices(config: AppConfig) -> Result<()> {
     let indexes = config.data_dir.join("indexes");
     let hot = config.data_dir.join("hot");
@@ -823,4 +1088,62 @@ async fn rebuild_indices(config: AppConfig) -> Result<()> {
         backup.display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod cli_parse_tests {
+    use super::*;
+
+    #[test]
+    fn batch_steer_lock_and_assign_basin_go_to_steer_opts() {
+        let cli = Cli::try_parse_from([
+            "splatrag",
+            "steer",
+            "--memory",
+            "00000000-0000-0000-0000-000000000001",
+            "--basin",
+            "room-1",
+            "--assign-basin",
+            "home",
+            "--lock",
+            "--gain",
+            "-0.2",
+            "--budget",
+            "0.2",
+        ])
+        .expect("batch steer should parse");
+        let Command::Steer {
+            memory_id,
+            memories,
+            basins,
+            budget,
+            gain,
+            op,
+            mass,
+            assign_basin,
+            lock,
+            axis,
+        } = cli.command
+        else {
+            panic!("expected steer");
+        };
+        assert!(memory_id.is_none());
+        assert_eq!(memories.len(), 1);
+        assert_eq!(basins, ["room-1"]);
+        assert_eq!(budget, Some(0.2));
+        let opts = steer_opts_from_flags(gain, &op, mass, assign_basin, lock, &axis).unwrap();
+        assert!(opts.basin_locked, "--lock must reach SteerOpts on batch");
+        assert_eq!(opts.basin_id.as_deref(), Some("home"));
+        assert!(opts.gain < 0.0);
+        let addresses = steer_addresses_from_cli(None, memories, basins).unwrap();
+        assert_eq!(addresses.len(), 2);
+        assert!(addresses[0].memory_id.is_some());
+        assert_eq!(addresses[1].basin_id.as_deref(), Some("room-1"));
+        assert!(
+            addresses
+                .iter()
+                .all(|a| a.basin_id.as_deref() != Some("home")),
+            "--assign-basin is SteerOpts, not a room address"
+        );
+    }
 }

@@ -1,0 +1,16 @@
+[Unit]
+Description=SplatRAG HTTP service (viewer + API + MCP)
+After=network-online.target splatrag-embed.service
+Wants=network-online.target splatrag-embed.service
+
+[Service]
+Type=simple
+WorkingDirectory=/path/to/splatrag
+ExecStart=/path/to/splatrag/target/release/splatrag --config /path/to/splatrag/splatrag.toml serve
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=180
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

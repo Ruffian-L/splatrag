@@ -43,6 +43,22 @@ pub struct RetrievalArms {
     pub geometry: HashMap<String, GeometrySignal>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ScoredId {
+    pub id: Uuid,
+    pub score: f32,
+}
+
+/// Scored BM25 and 64-d HNSW pools plus the query embeddings. Used by role diagnostics;
+/// ranking is unchanged.
+#[derive(Debug, Clone)]
+pub struct RetrievalPool {
+    pub query_full: Vec<f32>,
+    pub query_64: Vec<f32>,
+    pub bm25: Vec<ScoredId>,
+    pub hnsw64: Vec<ScoredId>,
+}
+
 /// One live-field frame for the SplatLens SSE feed / frame log.
 #[derive(Debug, Clone, Serialize)]
 pub struct LiveFrame {
@@ -620,6 +636,59 @@ impl MemoryService {
         })
     }
 
+    /// BM25 and 64-d HNSW candidate lists with scores. Does not run fusion or 4096-d rerank.
+    pub async fn retrieval_pool(
+        &self,
+        query: &str,
+        candidate_limit: usize,
+        filters: &RecallFilters,
+    ) -> Result<RetrievalPool> {
+        let candidate_limit = candidate_limit.clamp(1, 500);
+        self.refresh_from_cold()?;
+        let records = self.records_read();
+        let lexical = self.lexical.search(query, candidate_limit)?;
+        let full_query = self.embedding.embed(query).await?;
+        let local_query = matryoshka64(&full_query)?;
+        let local_dense = self.ann.search(&local_query, candidate_limit)?;
+
+        let mut bm25 = Vec::new();
+        for hit in lexical {
+            if let Some(mem) = records.get(&hit.id)
+                && mem.matches(filters)
+            {
+                bm25.push(ScoredId {
+                    id: hit.id,
+                    score: hit.score,
+                });
+            }
+        }
+        let mut hnsw64 = Vec::new();
+        for hit in local_dense {
+            if let Some(mem) = records.get(&hit.id)
+                && mem.matches(filters)
+            {
+                hnsw64.push(ScoredId {
+                    id: hit.id,
+                    score: (1.0 - hit.distance).max(0.0),
+                });
+            }
+        }
+        Ok(RetrievalPool {
+            query_full: full_query,
+            query_64: local_query,
+            bm25,
+            hnsw64,
+        })
+    }
+
+    pub async fn embed_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        self.embedding.embed_batch(texts).await
+    }
+
+    pub fn records_snapshot(&self) -> HashMap<Uuid, MemoryRecord> {
+        self.records_read().clone()
+    }
+
     /// Pick memories for a live steering host, with the knobs to apply them.
     ///
     /// Deliberately over-fetches to a depth that does **not** track `limit`: `separation` needs
@@ -749,13 +818,7 @@ impl MemoryService {
             }
             hot.clone()
         };
-        self.emit_live_frame(live_frame_from(
-            &work,
-            0,
-            work.kinetic_energy,
-            true,
-            false,
-        ));
+        self.emit_live_frame(live_frame_from(&work, 0, work.kinetic_energy, true, false));
 
         let tx = self.live_tx.clone();
         let log_path = self.live_log.read().ok().and_then(|g| g.clone());
@@ -1342,7 +1405,9 @@ impl MemoryService {
         }
 
         self.ann.save()?;
-        let result = self.hot_read().save(&hot_path, &self.config.packed_geometry_path());
+        let result = self
+            .hot_read()
+            .save(&hot_path, &self.config.packed_geometry_path());
         guard.release();
         result
     }
@@ -1952,10 +2017,7 @@ mod axis_tests {
         let room = room_semantics(&hot, "room-1").unwrap();
         let m0 = &hot.splats[0].semantics;
         let cos0 = inversion::cosine(&room, m0).unwrap();
-        assert!(
-            cos0 < 0.9,
-            "room 64-d must not be member 0, cos={cos0}"
-        );
+        assert!(cos0 < 0.9, "room 64-d must not be member 0, cos={cos0}");
         assert!((room[0] - room[1]).abs() < 1e-4, "mean of e0 and e1");
     }
 
@@ -2017,10 +2079,7 @@ mod axis_tests {
             "gain≠0 must move the room, cos={cos_moved}"
         );
         let cos_m0 = inversion::cosine(&room, &member0_before).unwrap();
-        assert!(
-            cos_m0 < 0.9,
-            "room 64-d must not be member 0, cos={cos_m0}"
-        );
+        assert!(cos_m0 < 0.9, "room 64-d must not be member 0, cos={cos_m0}");
         assert!(
             (report.cosine_before_after - cos_moved).abs() < 1e-5,
             "receipt cosine is the room, not a member"
@@ -2125,8 +2184,7 @@ mod axis_tests {
         opts.basin_id = Some("rehomed".into());
         opts.basin_locked = true;
         let mut ann = Vec::new();
-        let report =
-            apply_one_address(&mut hot, &addr, 1.0, 0.0, &opts, None, &mut ann).unwrap();
+        let report = apply_one_address(&mut hot, &addr, 1.0, 0.0, &opts, None, &mut ann).unwrap();
         assert_eq!(report.kind, "basin");
         assert_eq!(report.applied_gain, 0.0);
         assert!(ann.is_empty());
@@ -2159,7 +2217,9 @@ mod cold_refresh_tests {
         );
         let added = service.refresh_from_cold().unwrap();
         assert_eq!(added, 1);
-        let loaded = service.record(record.id).expect("refresh must insert the row");
+        let loaded = service
+            .record(record.id)
+            .expect("refresh must insert the row");
         assert!(
             loaded.text.contains("yesetday"),
             "live jsonl text must be queryable after refresh"

@@ -14,6 +14,8 @@ pub struct AppConfig {
     pub retrieval: RetrievalConfig,
     pub physics: PhysicsConfig,
     pub server: ServerConfig,
+    /// Pick knobs for this silo. Default off so personal/MCP/SciFact stay flag-only.
+    pub pick: PickSettings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,6 +63,16 @@ pub struct RetrievalConfig {
     /// RRF constant k (classic = 60). Only used when fusion = "rrf".
     #[serde(default = "default_rrf_k")]
     pub rrf_k: f32,
+    /// CombMNZ: multiply RRF by how many of {BM25, dense} ranked the candidate.
+    /// Both-hit golds at 11–20 beat single-arm FPs in the top 10. Default off.
+    #[serde(default)]
+    pub rrf_mnz: bool,
+    /// Add query-term coverage of the document (title-weighted). Not qrels.
+    #[serde(default)]
+    pub weight_coverage: f32,
+    /// Add max query-term coverage of any one sentence. SciFact claims are local.
+    #[serde(default)]
+    pub weight_sentence: f32,
     /// Min-max normalize BM25 and cosine over the candidate set before linear fusion.
     #[serde(default)]
     pub normalize_scores: bool,
@@ -91,6 +103,21 @@ pub struct RetrievalConfig {
     /// if false (default), uses max only.
     #[serde(default)]
     pub basin_local_sum: bool,
+    /// Skip local-neighborhood boost when the candidate's basin has more members
+    /// than this. Mega-components (~20k unlabeled bags) otherwise drown BM25.
+    /// 0 = no size cap.
+    #[serde(default = "default_basin_local_max_members")]
+    pub basin_local_max_members: usize,
+    /// If > 1, take `limit * rerank_pool` by fusion then sort that pool by `rerank`.
+    /// 0 / 1 = off.
+    #[serde(default)]
+    pub rerank_pool: usize,
+    /// `bm25` | `cosine` | empty (leave fusion order). SciFact is lexical — cosine died.
+    #[serde(default)]
+    pub rerank: String,
+    /// Extra RRF weight for the full-dim embed arm (`rerank = "full"`). 0 = use weight_cosine.
+    #[serde(default)]
+    pub weight_full: f32,
 }
 
 fn default_basin_local_threshold() -> f32 {
@@ -99,6 +126,10 @@ fn default_basin_local_threshold() -> f32 {
 
 fn default_basin_expand_seeds() -> usize {
     8
+}
+
+fn default_basin_local_max_members() -> usize {
+    200
 }
 
 fn default_fusion() -> String {
@@ -113,9 +144,17 @@ fn default_rrf_k() -> f32 {
 #[serde(default)]
 pub struct PhysicsConfig {
     pub steps: usize,
+    /// `auto` | `cpu` | `cuda`. `auto` uses CUDA when the kernels compiled and
+    /// the device probes; otherwise the Rayon CPU loop. CUDA failure falls back.
+    #[serde(default = "default_physics_backend")]
+    pub backend: String,
     pub dt: f32,
     pub damping: f32,
     pub origin_pull: f32,
+    /// Spatial-hash halo in neighbor-mode dream. Pair forces inside this radius
+    /// include core/semantic repulsion even when the other splat is not an ANN
+    /// neighbor. Attraction still comes only from the ANN list (otherwise a packed
+    /// field re-glues). Unused by physics before 2026-08-20.
     pub neighbor_radius: f32,
     pub attraction: f32,
     pub semantic_threshold: f32,
@@ -126,7 +165,53 @@ pub struct PhysicsConfig {
     pub cross_domain_repulsion: f32,
     pub basin_radius: f32,
     pub min_basin_size: usize,
+    /// After discovery, components larger than this are axis-split into bags (not semantic cuts).
+    /// Hardcoded 5000 historically; exposed so personal-store scale can be measured without forks.
+    /// Set `0` to disable the bag split and keep pure geometry components.
+    #[serde(default = "default_basin_max_members")]
+    pub basin_max_members: usize,
+    /// How many 64d neighbors seed basin edges. 0 = all pairs above `semantic_threshold`.
+    /// Discovery packs to hidden-state geometry, not 3D cell percolation.
+    #[serde(default = "default_basin_knn")]
+    pub basin_knn: usize,
+    /// Two basins that already have `min_basin_size` members merge only if cosine
+    /// is at least this. Stops a weak k-NN bridge from gluing two wells into soup.
+    #[serde(default = "default_basin_core_cosine")]
+    pub basin_core_cosine: f32,
+    /// Crumbs join the nearest existing well at this cosine. Never merges two wells.
+    /// Gaussian falloff onto a mode; 0 disables attach.
+    #[serde(default = "default_basin_attach_cosine")]
+    pub basin_attach_cosine: f32,
     pub spatial_cell_size: f32,
+    /// Collapse byte-identical texts to one representative splat before the physics runs.
+    /// Ingest stays lossless; this is where the boilerplate an export drags in stops
+    /// bending the field. See `crate::dedupe`.
+    #[serde(default = "default_dedupe_duplicates")]
+    pub dedupe_duplicates: bool,
+}
+
+fn default_dedupe_duplicates() -> bool {
+    true
+}
+
+fn default_physics_backend() -> String {
+    "auto".into()
+}
+
+fn default_basin_max_members() -> usize {
+    5_000
+}
+
+fn default_basin_knn() -> usize {
+    8
+}
+
+fn default_basin_core_cosine() -> f32 {
+    0.80
+}
+
+fn default_basin_attach_cosine() -> f32 {
+    0.72
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,6 +231,29 @@ impl Default for AppConfig {
             retrieval: RetrievalConfig::default(),
             physics: PhysicsConfig::default(),
             server: ServerConfig::default(),
+            pick: PickSettings::default(),
+        }
+    }
+}
+
+/// Per-silo pick defaults. Scratch friendship field sets `hybrid = true` so
+/// `pick Q` reranks without `--hybrid`. Personal config leaves this off.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PickSettings {
+    pub hybrid: bool,
+    pub track_usage: bool,
+    pub hybrid_beta: f32,
+    pub easyway: bool,
+}
+
+impl Default for PickSettings {
+    fn default() -> Self {
+        Self {
+            hybrid: false,
+            track_usage: false,
+            hybrid_beta: 2.0,
+            easyway: false,
         }
     }
 }
@@ -197,6 +305,9 @@ impl Default for RetrievalConfig {
             hnsw_ef_search: 80,
             fusion: default_fusion(),
             rrf_k: default_rrf_k(),
+            rrf_mnz: false,
+            weight_coverage: 0.0,
+            weight_sentence: 0.0,
             normalize_scores: false,
             weight_basin_peer: 0.0,
             weight_basin_centroid: 0.0,
@@ -206,6 +317,10 @@ impl Default for RetrievalConfig {
             basin_local_threshold: default_basin_local_threshold(),
             basin_graph_expand: 0,
             basin_local_sum: false,
+            basin_local_max_members: default_basin_local_max_members(),
+            rerank_pool: 0,
+            rerank: String::new(),
+            weight_full: 0.0,
         }
     }
 }
@@ -218,6 +333,7 @@ impl Default for PhysicsConfig {
             // (median cross-domain distance over median same-domain distance). Settles by ~600
             // steps and holds through 2400.
             steps: 1200,
+            backend: default_physics_backend(),
             dt: 0.02,
             damping: 0.9,
             origin_pull: 0.05,
@@ -238,7 +354,12 @@ impl Default for PhysicsConfig {
             cross_domain_repulsion: 0.15,
             basin_radius: 0.8,
             min_basin_size: 3,
+            basin_max_members: default_basin_max_members(),
+            basin_knn: default_basin_knn(),
+            basin_core_cosine: default_basin_core_cosine(),
+            basin_attach_cosine: default_basin_attach_cosine(),
             spatial_cell_size: 1.0,
+            dedupe_duplicates: default_dedupe_duplicates(),
         }
     }
 }
@@ -285,10 +406,7 @@ pub fn assert_loopback_bind(bind: &str, field: &str) -> Result<()> {
         );
     }
 
-    let ok = host == "127.0.0.1"
-        || host == "localhost"
-        || host == "::1"
-        || host == "[::1]";
+    let ok = host == "127.0.0.1" || host == "localhost" || host == "::1" || host == "[::1]";
     if !ok {
         anyhow::bail!(
             "{field}={bind:?} is not loopback. Allowed hosts: 127.0.0.1, localhost, ::1. \

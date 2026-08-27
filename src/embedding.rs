@@ -178,10 +178,13 @@ impl LabelingClient {
             .join("\n");
         // The word cap is load-bearing: small local models write expansive summaries and run past
         // max_tokens mid-object, which reaches the parser as unterminated JSON.
+        // Keep the original SplatRAG prompt short. Labels are cosmetic; do not invent a second
+        // product in the prompt. Speakers (Shep/Echo/…) are who speaks, not the theme.
         let prompt = format!(
             "Name this AI-memory basin from its representative messages.\n\
              Return only JSON with string fields label, path, summary.\n\
-             label: 2-6 concrete words. path: slash-separated hierarchy. \
+             label: 2-6 concrete words (theme of the content, not speaker names).\n\
+             path: slash-separated hierarchy (not filesystem paths).\n\
              summary: one sentence of at most 25 words, grounded in the messages.\n\n{evidence}"
         );
         let url = format!(
@@ -297,9 +300,12 @@ pub struct BasinLabelDraft {
 }
 
 fn parse_label_json(content: &str) -> Result<BasinLabelDraft> {
-    let start = content
-        .find('{')
-        .with_context(|| format!("label response has no JSON object: {:?}", truncate(content, 200)))?;
+    let start = content.find('{').with_context(|| {
+        format!(
+            "label response has no JSON object: {:?}",
+            truncate(content, 200)
+        )
+    })?;
     // An opening brace with no closing one is the signature of a response cut off at max_tokens,
     // so echo the tail — "malformed JSON" alone sends you looking in the wrong place.
     let end = content.rfind('}').with_context(|| {
