@@ -1,0 +1,69 @@
+# Rendered by ./claim.sh — do not edit the rendered copy, edit this template.
+# __TOKEN__ placeholders are substituted at run time; the rendered file is written
+# into the receipt directory so the exact config is part of the receipt.
+#
+# Retrieval knobs are the basin local-sum soft neighborhood, matching
+# examples/splatrag.basin-local-sum.example.toml and research_logs/2026-08-05_basin_local_sum.md.
+
+data_dir = "__DATA_DIR__"
+scope_key = "__SCOPE_KEY__"
+
+# Not needed for the claim: the local HNSW + Tantivy path is the one under test.
+[qdrant]
+url = "http://127.0.0.1:6360"
+collection = "splatrag-claim"
+enabled = false
+
+[embedding]
+url = "__EMBED_URL__"
+model = "Qwen3-Embedding-8B-Q8_0.gguf"
+dimensions = 4096
+batch_size = 32
+timeout_seconds = 600
+
+# Basin labels are cosmetic and cost a second model. The claim does not read them.
+[labeling]
+url = "http://127.0.0.1:8082"
+model = "gemma-3-4b-it-q4_0.gguf"
+enabled = false
+timeout_seconds = 180
+
+[retrieval]
+weight_cosine = 10.0
+weight_bm25 = 1.0
+weight_radiance = 5.0
+candidate_multiplier = 8
+hnsw_max_nodes = 1000000
+hnsw_m = 16
+hnsw_ef_construction = 200
+hnsw_ef_search = 80
+weight_basin_peer = 0.0
+weight_basin_centroid = 0.0
+basin_expand_max_size = 0
+basin_expand_seeds = 8
+# Soft semantic neighborhood: sum of nearby dense scores, so candidates sitting at the
+# centre of a dense-hit clump outrank isolated ones. Geometry, not domain stamps.
+weight_basin_local = 0.3
+basin_local_threshold = 0.50
+basin_local_sum = true
+basin_graph_expand = 0
+
+[physics]
+steps = __PHYSICS_STEPS__
+dt = 0.02
+damping = 0.9
+origin_pull = 0.05
+neighbor_radius = 2.0
+attraction = 2.0
+semantic_threshold = 0.55
+repulsion_radius = 0.5
+repulsion = 5.0
+semantic_repulsion = 2.0
+# The quarantine dial. 0.15 isolates a junk domain while keeping clusters meaningful.
+cross_domain_repulsion = 0.15
+basin_radius = 0.8
+min_basin_size = 3
+spatial_cell_size = 1.0
+
+[server]
+bind = "__BIND__"

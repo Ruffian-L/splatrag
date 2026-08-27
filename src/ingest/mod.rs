@@ -1,6 +1,6 @@
 pub mod extract;
 
-use crate::record::{AttachmentRef, MemoryRecord};
+use crate::record::{AttachmentRef, MemoryRecord, clean_speaker};
 use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use clap::ValueEnum;
@@ -235,7 +235,11 @@ impl Ingestor {
                     continue;
                 }
             };
-            let Some(text) = extracted.text.as_ref().filter(|text| !text.trim().is_empty()) else {
+            let Some(text) = extracted
+                .text
+                .as_ref()
+                .filter(|text| !text.trim().is_empty())
+            else {
                 report.pending += 1;
                 continue;
             };
@@ -569,7 +573,9 @@ fn claude_records(path: &Path, value: Value, domain: &str) -> Result<Vec<MemoryR
         record.source_record_id = Some(message_id);
         record.conversation_id = Some(conversation_id.clone());
         record.turn_index = Some(index as u64);
-        record.speaker = string_at(message, &["sender"]).or_else(|| string_at(message, &["role"]));
+        record.speaker = clean_speaker(
+            string_at(message, &["sender"]).or_else(|| string_at(message, &["role"])),
+        );
         record.model = string_at(message, &["model"]);
         record.parent_id = string_at(message, &["parent_message_uuid"])
             .or_else(|| string_at(message, &["parent_id"]));
@@ -618,9 +624,11 @@ fn grok_records(path: &Path, value: Value, domain: &str) -> Result<Vec<MemoryRec
         record.source_record_id = Some(message_id);
         record.conversation_id = Some(conversation_id.clone());
         record.turn_index = Some(index as u64);
-        record.speaker = ["sender", "role", "author"]
-            .iter()
-            .find_map(|key| string_at(response, &[*key]));
+        record.speaker = clean_speaker(
+            ["sender", "role", "author"]
+                .iter()
+                .find_map(|key| string_at(response, &[*key])),
+        );
         record.model = string_at(response, &["model"]).or_else(|| string_at(wrapper, &["model"]));
         record.parent_id = string_at(response, &["parent_id"]);
         record.timestamp = timestamp_at(response);
@@ -653,12 +661,6 @@ fn clean(value: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-/// Speakers additionally case-fold: the same export writes both `assistant` and `ASSISTANT`, and
-/// two spellings of one role would split every grouping and filter that touches it.
-fn clean_speaker(value: Option<String>) -> Option<String> {
-    clean(value).map(|value| value.to_lowercase())
-}
-
 /// Locate the payload for one asset directory. The export stores each blob as
 /// `<asset-uuid>/content`; a few entries are plain files (profile pictures) instead of directories.
 fn asset_blob(entry: &Path) -> Option<PathBuf> {
@@ -679,8 +681,7 @@ fn grok_export_conversation(
     let conversation = entry
         .get("conversation")
         .context("export entry has no conversation object")?;
-    let conversation_id =
-        string_at(conversation, &["id"]).context("conversation has no id")?;
+    let conversation_id = string_at(conversation, &["id"]).context("conversation has no id")?;
     let title = string_at(conversation, &["title"]).filter(|title| !title.trim().is_empty());
     let responses = entry
         .get("responses")
@@ -793,11 +794,16 @@ fn jsonl_record(
     if text.trim().is_empty() {
         return None;
     }
-    let source = match kind {
-        SourceKind::Gemini => "gemini-cli",
-        SourceKind::AgentJsonl => "agent-jsonl",
-        _ => "jsonl",
-    };
+    let source = string_at(&value, &["source"])
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            match kind {
+                SourceKind::Gemini => "gemini-cli",
+                SourceKind::AgentJsonl => "agent-jsonl",
+                _ => "jsonl",
+            }
+            .to_string()
+        });
     let record_id = ["_id", "uuid", "id", "message_id"]
         .iter()
         .find_map(|key| string_at(&value, &[*key]))
@@ -805,27 +811,44 @@ fn jsonl_record(
     let conversation_id = ["conversation_id", "session_id", "sessionId"]
         .iter()
         .find_map(|key| string_at(&value, &[*key]));
-    let source_key = format!(
-        "{}#{}#{}",
-        path.display(),
-        conversation_id.as_deref().unwrap_or("session"),
-        record_id
-    );
+    let source_key = string_at(&value, &["source_key"])
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            format!(
+                "{}#{}#{}",
+                path.display(),
+                conversation_id.as_deref().unwrap_or("session"),
+                record_id
+            )
+        });
     let mut record = MemoryRecord::new(source, source_key, text);
     record.domain = domain.into();
-    record.source_file = Some(path.display().to_string());
+    record.source_file = string_at(&value, &["source_file"])
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| Some(path.display().to_string()));
     record.source_record_id = Some(record_id);
     record.conversation_id = conversation_id;
-    record.turn_index = Some(line_index as u64);
-    record.speaker = ["role", "sender", "type"]
-        .iter()
-        .find_map(|key| string_at(body, &[*key]))
-        .or_else(|| string_at(&value, &["type"]));
+    record.turn_index = value
+        .get("turn_index")
+        .and_then(Value::as_u64)
+        .or(Some(line_index as u64));
+    record.speaker = clean_speaker(
+        ["role", "sender", "speaker", "type"]
+            .iter()
+            .find_map(|key| string_at(body, &[*key]))
+            .or_else(|| string_at(&value, &["speaker"]))
+            .or_else(|| string_at(&value, &["type"])),
+    );
     record.model = string_at(body, &["model"]).or_else(|| string_at(&value, &["model"]));
     record.parent_id =
         string_at(&value, &["parent_id"]).or_else(|| string_at(&value, &["parentUuid"]));
     record.timestamp = timestamp_at(&value).or_else(|| timestamp_at(body));
     record.attachments = attachment_values(body);
+    if let Some(metadata) = value.get("metadata").and_then(Value::as_object) {
+        for (key, val) in metadata {
+            record.metadata.insert(key.clone(), val.clone());
+        }
+    }
     Some(record)
 }
 
@@ -871,7 +894,7 @@ fn semantic_md_record(
     record.domain = domain.into();
     record.source_file = Some(path.display().to_string());
     record.source_record_id = Some(key.into());
-    record.speaker = agent;
+    record.speaker = clean_speaker(agent);
     record.timestamp = parse_timestamp(timestamp_text);
     Ok(record)
 }
@@ -958,7 +981,10 @@ fn memory_md_record(path: &Path, raw: &str, domain: &str) -> Result<MemoryRecord
         anyhow::bail!("memory file has front matter but an empty body");
     }
 
-    let stem = path.file_stem().and_then(|stem| stem.to_str()).unwrap_or_default();
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default();
     let name = fields
         .get("name")
         .and_then(Value::as_str)
@@ -995,14 +1021,16 @@ fn memory_md_record(path: &Path, raw: &str, domain: &str) -> Result<MemoryRecord
     record.domain = resolved_domain;
     record.source_file = Some(path.display().to_string());
     record.source_record_id = Some(name.clone());
-    record.speaker = Some("assistant".into());
+    record.speaker = clean_speaker(Some("assistant".into()));
     record.timestamp = metadata
         .and_then(|metadata| metadata.get("modified"))
         .and_then(Value::as_str)
         .and_then(|stamp| DateTime::parse_from_rfc3339(stamp).ok())
         .map(|stamp| stamp.with_timezone(&Utc));
 
-    record.metadata.insert("memory_name".into(), Value::String(name));
+    record
+        .metadata
+        .insert("memory_name".into(), Value::String(name));
     if !description.is_empty() {
         record
             .metadata
@@ -1338,7 +1366,42 @@ mod tests {
             .unwrap();
         assert_eq!(records[0].conversation_id.as_deref(), Some("s1"));
         assert_eq!(records[0].model.as_deref(), Some("local"));
-        assert_eq!(records[0].speaker.as_deref(), Some("assistant"));
+        assert_eq!(records[0].speaker.as_deref(), Some("collaborator"));
+    }
+
+    #[test]
+    fn agent_jsonl_honors_source_key_and_collapses_brand_speakers() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("staged.agent.jsonl");
+        fs::write(
+            &path,
+            r#"{"source":"grok-cli","source_key":"grok-cli/s1/m1","source_file":"/orig/chat_history.jsonl","session_id":"s1","uuid":"m1","turn_index":3,"timestamp":"2026-08-19T10:56:15Z","metadata":{"type":"grok-cli","kind":"cli-session","timestamp_scope":"session"},"message":{"role":"claude","content":"hello"}}"#,
+        )
+        .unwrap();
+        let mut records = Vec::new();
+        Ingestor::new(temp.path().join("errors.jsonl"))
+            .ingest_path(SourceKind::AgentJsonl, &path, "chat", |record| {
+                records.push(record);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(records[0].source, "grok-cli");
+        assert_eq!(records[0].source_key, "grok-cli/s1/m1");
+        assert_eq!(
+            records[0].source_file.as_deref(),
+            Some("/orig/chat_history.jsonl")
+        );
+        assert_eq!(records[0].speaker.as_deref(), Some("collaborator"));
+        assert_eq!(records[0].turn_index, Some(3));
+        assert!(records[0].timestamp.is_some(), "date survives ingest");
+        assert_eq!(
+            records[0].metadata.get("type").and_then(Value::as_str),
+            Some("grok-cli")
+        );
+        assert_eq!(
+            records[0].metadata.get("kind").and_then(Value::as_str),
+            Some("cli-session")
+        );
     }
 
     #[test]
@@ -1388,8 +1451,14 @@ mod tests {
         // `type` wins over the CLI-supplied domain because domain drives dream repulsion.
         assert_eq!(record.domain, "feedback");
         assert_eq!(record.source_key, "feedback-no-blades");
-        assert!(record.text.contains("blade on the end\" pattern"), "escaped quotes survive");
-        assert!(record.text.contains("let it end where it ends"), "body is embedded");
+        assert!(
+            record.text.contains("blade on the end\" pattern"),
+            "escaped quotes survive"
+        );
+        assert!(
+            record.text.contains("let it end where it ends"),
+            "body is embedded"
+        );
         assert_eq!(
             record.timestamp.map(|ts| ts.to_rfc3339()),
             Some("2026-07-21T21:06:31.468+00:00".into())
@@ -1402,8 +1471,11 @@ mod tests {
     fn memory_md_is_idempotent_and_skips_the_index() {
         let temp = tempfile::tempdir().unwrap();
         fs::write(temp.path().join("feedback_no_blades.md"), memory_fixture()).unwrap();
-        fs::write(temp.path().join("MEMORY.md"), "- [No blades](feedback_no_blades.md) — hook\n")
-            .unwrap();
+        fs::write(
+            temp.path().join("MEMORY.md"),
+            "- [No blades](feedback_no_blades.md) — hook\n",
+        )
+        .unwrap();
 
         let ingest = |records: &mut Vec<MemoryRecord>| {
             Ingestor::new(temp.path().join("errors.jsonl"))
@@ -1428,7 +1500,8 @@ mod tests {
     /// 1061 responses imported with `timestamp: None` and no error to show for it.
     #[test]
     fn mongo_extended_json_dates_parse() {
-        let millis = serde_json::json!({"create_time": {"$date": {"$numberLong": "1785272919201"}}});
+        let millis =
+            serde_json::json!({"create_time": {"$date": {"$numberLong": "1785272919201"}}});
         assert_eq!(
             timestamp_at(&millis).map(|ts| ts.to_rfc3339()),
             Some("2026-07-28T21:08:39.201+00:00".into())
@@ -1503,7 +1576,10 @@ mod tests {
         assert_eq!(first.model.as_deref(), Some("grok-4"));
         assert!(first.timestamp.is_some(), "mongo dates must survive ingest");
         assert_eq!(
-            first.metadata.get("conversation_title").and_then(Value::as_str),
+            first
+                .metadata
+                .get("conversation_title")
+                .and_then(Value::as_str),
             Some("Physics of Friendship")
         );
 
@@ -1560,7 +1636,7 @@ mod tests {
             .unwrap();
 
         let second = records.iter().find(|r| r.source_key == "resp-2").unwrap();
-        assert_eq!(second.speaker.as_deref(), Some("assistant"));
+        assert_eq!(second.speaker.as_deref(), Some("collaborator"));
         assert_eq!(second.model, None, "blank model is absent, not empty");
     }
 

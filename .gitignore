@@ -45,6 +45,8 @@ viz/
 /configs/niodoo-telemetry.toml
 /configs/niodoo-telemetry-stripped.toml
 /ops/systemd/splatrag-personal-serve.service
+/ops/systemd/splatrag-embed.service
+/ops/systemd/splatrag-silo@.service
 /scripts/mcp-for-grok.sh
 /scripts/mcp-for-silo.sh
 /scripts/verify_personal_doctor.sh

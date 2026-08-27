@@ -3,14 +3,14 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>SplatRAG Memory Field</title>
-  <link rel="stylesheet" href="/style.css?v=20260805-jlens1">
+  <title>SplatRAG Field (legacy — use v3 Basin Field viewer)</title>
+  <link rel="stylesheet" href="/style.css?v=20260816-niodoo-live">
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 </head>
 <body>
   <header>
     <div>
-      <p class="eyebrow">LOCAL AI MEMORY · mixed-control</p>
+      <p class="eyebrow">LOCAL AI MEMORY · personal</p>
       <h1>SplatRAG Field</h1>
     </div>
     <div id="status">connecting…</div>
@@ -19,9 +19,9 @@
     <section class="viewport">
       <canvas id="field"></canvas>
       <div class="controls">
-        <button id="basin-view" class="active">Basins</button>
-        <button id="memory-view">Memory splats</button>
-        <span>drag to orbit · wheel to zoom · click a splat</span>
+        <button id="basin-view">Basins</button>
+        <button id="memory-view" class="active">Memory splats</button>
+        <span>drag · zoom · click a star for text · colors = basin hue</span>
       </div>
     </section>
     <aside>
@@ -30,9 +30,9 @@
         <button>Recall</button>
       </form>
       <section id="jlens-panel" class="jlens-panel" aria-live="polite">
-        <p class="eyebrow">JLENS · FIRST THOUGHT (not SplatLens)</p>
-        <p class="meta jlens-help">When something is <em>read</em>, first generated-thought words from the model's own vocab map. Separate door from hybrid recall / the field.</p>
-        <p id="jlens-bridge" class="jlens-bridge quiet">paste text below · First thought loads Gemma (CPU, ~1 min first call)</p>
+        <p class="eyebrow">JLENS · OPTIONAL (not recall)</p>
+        <p class="meta jlens-help">Separate binary + GGUF. Reads text → residual → top vocab tokens (“first thought”). Does <em>not</em> search your cold log. If the binary is missing, this panel stays dead — recall still works.</p>
+        <p id="jlens-bridge" class="jlens-bridge quiet">checking jlens…</p>
         <div id="jlens-words" class="jlens-words"></div>
         <p id="jlens-meta" class="meta"></p>
         <button type="button" id="jlens-btn" class="jlens-run">First thought on search box</button>
@@ -43,7 +43,7 @@
       <div id="basins"></div>
     </aside>
   </main>
-  <script type="module" src="/app.js?v=20260805-jlens1"></script>
+  <script type="module" src="/app.js?v=20260816-niodoo-live"></script>
 </body>
 </html>
 

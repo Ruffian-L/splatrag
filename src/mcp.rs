@@ -1154,9 +1154,6 @@ fn load_silo_catalog() -> Value {
         std::env::var_os("SPLATRAG_SILOS").map(std::path::PathBuf::from),
         std::env::var_os("SPLATRAG_ROOT")
             .map(|root| std::path::Path::new(&root).join("..").join("silos.json")),
-        Some(std::path::PathBuf::from(
-            "/home/ruffianl/Hub/Projects/splatrag/silos.json",
-        )),
     ];
     for path in candidates.into_iter().flatten() {
         if let Ok(bytes) = std::fs::read(&path)

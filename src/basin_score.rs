@@ -71,6 +71,14 @@ pub fn basin_centroid_affinity(
     cosine(query_semantics, &acc).max(0.0)
 }
 
+/// Whether the local-neighborhood boost should run for a basin of this size.
+///
+/// `max_members == 0` means no cap. Mega-basins (tens of thousands of members)
+/// otherwise add a near-constant sum that drowns BM25 under RRF.
+pub fn local_boost_applies(member_count: usize, max_members: usize) -> bool {
+    max_members == 0 || member_count <= max_members
+}
+
 /// Combine hybrid base score with basin peer support and optional centroid affinity.
 ///
 /// `weight_peer` multiplies max dense score in the candidate's basin.
@@ -162,10 +170,7 @@ mod tests {
         let q = vec![1.0, 0.0, 0.0];
         let m1 = Uuid::from_u128(10);
         let m2 = Uuid::from_u128(11);
-        let sem = HashMap::from([
-            (m1, vec![1.0, 0.0, 0.0]),
-            (m2, vec![0.9, 0.1, 0.0]),
-        ]);
+        let sem = HashMap::from([(m1, vec![1.0, 0.0, 0.0]), (m2, vec![0.9, 0.1, 0.0])]);
         let high = basin_centroid_affinity(&q, &[m1, m2], &sem);
         let ortho = basin_centroid_affinity(&q, &[m1], &HashMap::from([(m1, vec![0.0, 1.0, 0.0])]));
         assert!(high > 0.9);
@@ -179,6 +184,16 @@ mod tests {
     }
 
     #[test]
+    fn huge_basin_skips_local_boost_small_basin_keeps_it() {
+        assert!(local_boost_applies(12, 200), "small basin is boosted");
+        assert!(
+            !local_boost_applies(20_983, 200),
+            "20k unlabeled bag must not get the local sum/max"
+        );
+        assert!(local_boost_applies(20_983, 0), "0 disables the cap");
+    }
+
+    #[test]
     fn empty_dense_yields_empty_support() {
         let support = basin_peer_dense_support(&HashMap::new(), &HashMap::new());
         assert!(support.is_empty());
@@ -187,10 +202,7 @@ mod tests {
     #[test]
     fn neighborhood_boost_uses_near_dense_hits() {
         let cand = vec![1.0, 0.0, 0.0];
-        let hits = vec![
-            (0.7, vec![0.99, 0.01, 0.0]),
-            (0.9, vec![0.0, 1.0, 0.0]),
-        ];
+        let hits = vec![(0.7, vec![0.99, 0.01, 0.0]), (0.9, vec![0.0, 1.0, 0.0])];
         let b = local_semantic_neighborhood_boost(&cand, &hits, 0.8);
         assert!((b - 0.7).abs() < 1e-4, "got {b}");
         let none = local_semantic_neighborhood_boost(&cand, &hits, 0.999);

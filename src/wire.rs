@@ -88,6 +88,9 @@ pub struct WireBasin {
     pub label_state: String,
     pub stability: f32,
     pub centroid: [f32; 3],
+    pub member_count: usize,
+    /// Sample only — full membership is `member_count` + `browse_basin`.
+    /// The personal unlabeled basin is ~62k ids and blows the palace boot.
     pub member_ids: Vec<String>,
     pub representative_ids: Vec<String>,
     pub updated_at: String,
@@ -112,7 +115,12 @@ impl From<&Basin> for WireBasin {
             label_state: wire_label_state(&b.label_state),
             stability: b.stability.clamp(0.0, 1.0),
             centroid: b.centroid,
-            member_ids: b.member_ids.iter().map(ToString::to_string).collect(),
+            member_count: b.member_ids.len(),
+            member_ids: b
+                .representative_ids
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
             representative_ids: b
                 .representative_ids
                 .iter()
@@ -174,7 +182,12 @@ mod tests {
         assert!(!obj.contains_key("context"));
         assert!(obj.contains_key("memory"));
         assert!(obj.contains_key("scores"));
-        assert!(!obj["memory"].as_object().unwrap().contains_key("content_sha256"));
+        assert!(
+            !obj["memory"]
+                .as_object()
+                .unwrap()
+                .contains_key("content_sha256")
+        );
     }
 
     #[test]
@@ -196,7 +209,7 @@ mod tests {
         let obj = v.as_object().unwrap();
         assert!(!obj.contains_key("parent_id"));
         assert_eq!(obj["label_state"], "stable");
-        assert!(obj["member_ids"][0].as_str().unwrap().len() > 0);
+        assert!(!obj["member_ids"][0].as_str().unwrap().is_empty());
         let updated = obj["updated_at"].as_str().unwrap();
         assert!(updated.ends_with('Z') || updated.contains('+'));
     }

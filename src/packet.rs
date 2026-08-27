@@ -525,7 +525,10 @@ mod tests {
         for step in 0..=5 {
             let t = step as f32 / 5.0;
             let c = cosine(&combine(&pair, &centroid, t).unwrap(), &centroid.axis);
-            assert!(c <= last + 1e-5, "cos to centroid must fall with t, broke at t={t}");
+            assert!(
+                c <= last + 1e-5,
+                "cos to centroid must fall with t, broke at t={t}"
+            );
             last = c;
         }
     }
@@ -536,11 +539,7 @@ mod tests {
         let refs: Vec<&[f32]> = field.iter().map(|v| v.as_slice()).collect();
         let centroid = FieldCentroid::estimate(&refs).unwrap();
 
-        let mut expected: Vec<f32> = field[0]
-            .iter()
-            .zip(&field[5])
-            .map(|(a, b)| a + b)
-            .collect();
+        let mut expected: Vec<f32> = field[0].iter().zip(&field[5]).map(|(a, b)| a + b).collect();
         normalize(&mut expected).unwrap();
 
         let got = combine(&[field[0].as_slice(), field[5].as_slice()], &centroid, 0.0).unwrap();
@@ -558,7 +557,10 @@ mod tests {
         let stripped =
             combine(&[field[2].as_slice(), field[11].as_slice()], &centroid, 1.0).unwrap();
         let c = cosine(&stripped, &centroid.axis);
-        assert!(c.abs() < 1e-5, "t = 1 must be orthogonal to the centre, got {c}");
+        assert!(
+            c.abs() < 1e-5,
+            "t = 1 must be orthogonal to the centre, got {c}"
+        );
     }
 
     #[test]

@@ -1,0 +1,62 @@
+# Public template for a personal / everyday memory store.
+# Copy → personal.toml (gitignored) and set data_dir OUTSIDE this repo.
+#
+#   cp configs/personal.example.toml configs/personal.toml
+#   # edit data_dir
+#   cargo run --release -- --config configs/personal.toml status
+#
+# NEVER commit personal.toml — it may point at your real store.
+
+data_dir = "/path/to/splatrag-runtime/stores/personal"
+scope_key = "splatrag-main"
+
+[qdrant]
+url = "http://127.0.0.1:6360"
+collection = "export-conversations"
+enabled = false
+
+[embedding]
+url = "http://127.0.0.1:8081"
+model = "Qwen3-Embedding-8B-Q8_0.gguf"
+dimensions = 4096
+batch_size = 32
+timeout_seconds = 180
+
+[labeling]
+url = "http://127.0.0.1:8082"
+model = "gemma-3-4b-it-q4_0.gguf"
+enabled = false
+timeout_seconds = 180
+
+[retrieval]
+weight_cosine = 10.0
+weight_bm25 = 1.0
+weight_radiance = 5.0
+candidate_multiplier = 8
+hnsw_max_nodes = 1000000
+hnsw_m = 16
+hnsw_ef_construction = 200
+hnsw_ef_search = 80
+weight_basin_local = 0.3
+basin_local_threshold = 0.50
+basin_local_sum = true
+
+[physics]
+steps = 1200
+dt = 0.02
+damping = 0.9
+origin_pull = 0.05
+neighbor_radius = 2.0
+attraction = 2.0
+semantic_threshold = 0.55
+repulsion_radius = 0.5
+repulsion = 5.0
+semantic_repulsion = 2.0
+cross_domain_repulsion = 0.15
+basin_radius = 0.8
+min_basin_size = 3
+basin_max_members = 5000
+spatial_cell_size = 1.0
+
+[server]
+bind = "127.0.0.1:8767"

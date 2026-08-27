@@ -1,0 +1,62 @@
+# Rendered by `./run init` into ./splatrag.toml (gitignored). Edit the rendered copy freely —
+# it is yours. Re-render any time with `./run init --force`.
+#
+# This is the everyday config: your own memory store, viewer, and agent tool surface.
+# For reproducing the benchmark see configs/claim.toml.in and ./claim.sh instead.
+
+data_dir = "__DATA_DIR__"
+scope_key = "__SCOPE_KEY__"
+
+# Optional. The local HNSW + Tantivy path works without it; enable if you already run Qdrant.
+[qdrant]
+url = "http://127.0.0.1:6360"
+collection = "export-conversations"
+enabled = false
+
+[embedding]
+url = "__EMBED_URL__"
+model = "Qwen3-Embedding-8B-Q8_0.gguf"
+dimensions = 4096
+batch_size = 32
+timeout_seconds = 180
+
+# Names your memory basins with a local instruction model. Turn on once you have one
+# running on this port, then: ./run dream --label
+[labeling]
+url = "__LABEL_URL__"
+model = "gemma-3-4b-it-q4_0.gguf"
+enabled = false
+timeout_seconds = 180
+
+[retrieval]
+weight_cosine = 10.0
+weight_bm25 = 1.0
+weight_radiance = 5.0
+candidate_multiplier = 8
+hnsw_max_nodes = 1000000
+hnsw_m = 16
+hnsw_ef_construction = 200
+hnsw_ef_search = 80
+weight_basin_local = 0.3
+basin_local_threshold = 0.50
+basin_local_sum = true
+
+[physics]
+steps = 1200
+dt = 0.02
+damping = 0.9
+origin_pull = 0.05
+neighbor_radius = 2.0
+attraction = 2.0
+semantic_threshold = 0.55
+repulsion_radius = 0.5
+repulsion = 5.0
+semantic_repulsion = 2.0
+cross_domain_repulsion = 0.15
+basin_radius = 0.8
+min_basin_size = 3
+spatial_cell_size = 1.0
+
+[server]
+# Loopback only. The binary rejects 0.0.0.0 and :: outright.
+bind = "__BIND__"

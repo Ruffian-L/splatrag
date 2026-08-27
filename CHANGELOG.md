@@ -2,6 +2,10 @@
 
 User-facing changes to the SplatRAG engine. Lab notes stay local.
 
+## 3.0.0 — 2026-08-28
+
+Engine files that the 3.0.0 README already named are now in git: `claim.sh`, `run`, CUDA dream, remaining `src/`, template configs, poison corpus. Machine systemd units stay local. Still no GitHub public flip.
+
 ## 3.0.0 — 2026-08-27
 
 First v3 engine release.

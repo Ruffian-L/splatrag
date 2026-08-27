@@ -108,6 +108,32 @@ impl LexicalIndex {
     }
 
     pub fn add_records(&self, records: &[MemoryRecord]) -> Result<()> {
+        self.add_records_with_heap(records, 64_000_000, false)
+    }
+
+    /// Rewrite `path` as a single-segment lexical index. Used by `compact-lexical`
+    /// so we never have to open an exploded on-disk store just to rebuild it.
+    pub fn rebuild(
+        path: impl Into<PathBuf>,
+        records: impl IntoIterator<Item = MemoryRecord>,
+    ) -> Result<Self> {
+        let path = path.into();
+        if path.exists() {
+            fs::remove_dir_all(&path)
+                .with_context(|| format!("failed to clear {}", path.display()))?;
+        }
+        let index = Self::open(&path)?;
+        let records: Vec<MemoryRecord> = records.into_iter().collect();
+        index.add_records_with_heap(&records, 256_000_000, true)?;
+        Ok(index)
+    }
+
+    fn add_records_with_heap(
+        &self,
+        records: &[MemoryRecord],
+        heap_bytes: usize,
+        wait_merge: bool,
+    ) -> Result<()> {
         if records.is_empty() {
             return Ok(());
         }
@@ -115,7 +141,7 @@ impl LexicalIndex {
         let domain = schema.get_field("domain")?;
         let model = schema.get_field("model")?;
         let conversation_id = schema.get_field("conversation_id")?;
-        let mut writer = self.index.writer(64_000_000)?;
+        let mut writer = self.index.writer(heap_bytes)?;
         for record in records {
             writer.add_document(doc!(
                 self.id => record.id.to_string(),
@@ -126,6 +152,9 @@ impl LexicalIndex {
             ))?;
         }
         writer.commit()?;
+        if wait_merge {
+            writer.wait_merging_threads()?;
+        }
         self.reader.reload()?;
         Ok(())
     }
@@ -194,6 +223,11 @@ impl LexicalIndex {
         Ok(terms)
     }
 
+    pub fn reload(&self) -> Result<()> {
+        self.reader.reload()?;
+        Ok(())
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -226,7 +260,10 @@ mod tests {
         index.add_records(&[target.clone(), decoy]).unwrap();
 
         let hits = index.search("what is the no blades rule", 10).unwrap();
-        assert_eq!(hits[0].id, target.id, "stemmed rare term must beat stopwords");
+        assert_eq!(
+            hits[0].id, target.id,
+            "stemmed rare term must beat stopwords"
+        );
     }
 
     #[test]
@@ -269,7 +306,24 @@ mod tests {
         }
 
         let hits = index.search("alpha (+)- thalassemia", 10).unwrap();
-        assert_eq!(hits[0].id, record.id, "punctuation must not suppress the match");
+        assert_eq!(
+            hits[0].id, record.id,
+            "punctuation must not suppress the match"
+        );
+    }
+
+    #[test]
+    fn rebuild_compacts_and_still_searches() {
+        let temp = tempfile::tempdir().unwrap();
+        let dest = temp.path().join("tantivy");
+        let a = MemoryRecord::new("test", "one", "persistent homology barcodes");
+        let b = MemoryRecord::new("test", "two", "gaussian splat memory basins");
+        let rebuilt = LexicalIndex::rebuild(&dest, [a.clone(), b]).unwrap();
+        let hits = rebuilt.search("barcode", 10).unwrap();
+        assert_eq!(hits[0].id, a.id);
+        let reopened = LexicalIndex::open(&dest).unwrap();
+        let hits = reopened.search("basin", 10).unwrap();
+        assert_eq!(hits.len(), 1);
     }
 
     /// Reopening must re-register the analyzer or every subsequent search fails.
@@ -283,7 +337,51 @@ mod tests {
             .add_records(std::slice::from_ref(&record))
             .unwrap();
 
-        let hits = LexicalIndex::open(&dir).unwrap().search("barcode", 10).unwrap();
+        let hits = LexicalIndex::open(&dir)
+            .unwrap()
+            .search("barcode", 10)
+            .unwrap();
         assert_eq!(hits[0].id, record.id);
+    }
+
+    #[test]
+    fn unique_typo_yesetday_outranks_yes() {
+        let temp = tempfile::tempdir().unwrap();
+        let index = LexicalIndex::open(temp.path().join("tantivy")).unwrap();
+        let target = MemoryRecord::new(
+            "cli-session",
+            "live",
+            "<user_query>\nyesetday i had you create file watchers to ingestr collaborator cli codec cli and collaborator cli jsonl are those still ingesting?\n</user_query>",
+        );
+        let decoy = MemoryRecord::new("claude", "short-yes", "yes");
+        index.add_records(&[target.clone(), decoy.clone()]).unwrap();
+        let hits = index.search("yesetday", 10).unwrap();
+        assert!(
+            !hits.is_empty(),
+            "yesetday must be a lexical term, not analyzed away"
+        );
+        assert_eq!(
+            hits[0].id,
+            target.id,
+            "unique typo must beat the short 'yes' decoy, scores {:?}",
+            hits.iter().map(|h| (h.id, h.score)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn reload_picks_up_commits_from_another_handle() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("tantivy");
+        let reader = LexicalIndex::open(&dir).unwrap();
+        let writer = LexicalIndex::open(&dir).unwrap();
+        let record =
+            MemoryRecord::new("cli-session", "live", "yesetday file watchers ingest jsonl");
+        writer.add_records(std::slice::from_ref(&record)).unwrap();
+        reader.reload().unwrap();
+        let hits = reader.search("yesetday", 10).unwrap();
+        assert_eq!(
+            hits[0].id, record.id,
+            "reload() is how a long-lived MCP sees sidecar ingest"
+        );
     }
 }

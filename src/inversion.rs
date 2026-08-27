@@ -10,7 +10,7 @@
 //! These ops are dim-agnostic: any equal-length unit (or near-unit) vectors work.
 //! SplatRAG applies them on 64-d matryoshka semantics.
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
 /// Measured sweet-band floor / ceiling for |α| when inverting.
@@ -84,6 +84,15 @@ pub fn clamp_alpha(gain: f32) -> f32 {
     sign * mag
 }
 
+/// Cap |gain| at [`ALPHA_MAX`] without lifting small shares up to [`ALPHA_MIN`].
+///
+/// One budget split across N addresses can land below 0.05. Flooring each share
+/// back to 0.05 would restack the total past collapse. Used by batch steer only.
+pub fn clamp_alpha_share(gain: f32) -> f32 {
+    let sign = if gain < 0.0 { -1.0 } else { 1.0 };
+    sign * gain.abs().min(ALPHA_MAX)
+}
+
 pub fn collapse_risk(gain: f32) -> bool {
     gain.abs() >= COLLAPSE_ONSET
 }
@@ -129,8 +138,7 @@ pub fn projection_scalar(h: &[f32], target: &[f32]) -> Result<f32> {
 pub fn naive_projection_flip(h: &[f32], target: &[f32], alpha: f32) -> Result<Vec<f32>> {
     ensure_same_len(h, target)?;
     let p = projection_scalar(h, target)?;
-    Ok(h
-        .iter()
+    Ok(h.iter()
         .zip(target)
         .map(|(hv, tv)| *hv - (1.0 + alpha) * p * *tv)
         .collect())
@@ -142,8 +150,7 @@ pub fn polarity_aware_inversion(h: &[f32], target: &[f32], alpha: f32) -> Result
     let p = projection_scalar(h, target)?;
     let target_p = polarity_target_projection(p, alpha);
     let correction = target_p - p;
-    Ok(h
-        .iter()
+    Ok(h.iter()
         .zip(target)
         .map(|(hv, tv)| *hv + correction * *tv)
         .collect())
@@ -163,8 +170,7 @@ pub fn householder_blend(h: &[f32], direction: &[f32], strength: f32) -> Result<
     let d = normalize(direction)?;
     let p = dot(h, &d)?;
     let s = strength.clamp(0.0, 1.0);
-    Ok(h
-        .iter()
+    Ok(h.iter()
         .zip(&d)
         .map(|(hv, dv)| {
             let reflected = *hv - 2.0 * p * *dv;
@@ -178,11 +184,7 @@ pub fn negative_gain_push(h: &[f32], direction: &[f32], strength: f32) -> Result
     ensure_same_len(h, direction)?;
     let d = normalize(direction)?;
     let scale = -strength * norm(h);
-    Ok(h
-        .iter()
-        .zip(&d)
-        .map(|(hv, dv)| *hv + scale * *dv)
-        .collect())
+    Ok(h.iter().zip(&d).map(|(hv, dv)| *hv + scale * *dv).collect())
 }
 
 pub fn householder_reflect(x: &[f32], normal: &[f32]) -> Result<Vec<f32>> {
@@ -192,8 +194,7 @@ pub fn householder_reflect(x: &[f32], normal: &[f32]) -> Result<Vec<f32>> {
         bail!("householder normal has zero norm");
     }
     let scale = 2.0 * dot(x, normal)? / denom;
-    Ok(x
-        .iter()
+    Ok(x.iter()
         .zip(normal)
         .map(|(xv, nv)| *xv - scale * *nv)
         .collect())
@@ -248,14 +249,39 @@ pub fn apply_steering(
     gain: f32,
     op: InversionOp,
 ) -> Result<Vec<f32>> {
+    apply_steering_clamped(semantics, axis, gain, op, true)
+}
+
+/// Like [`apply_steering`] but does not lift tiny shares up to [`ALPHA_MIN`].
+pub fn apply_steering_share(
+    semantics: &[f32],
+    axis: &[f32],
+    gain: f32,
+    op: InversionOp,
+) -> Result<Vec<f32>> {
+    apply_steering_clamped(semantics, axis, gain, op, false)
+}
+
+fn apply_steering_clamped(
+    semantics: &[f32],
+    axis: &[f32],
+    gain: f32,
+    op: InversionOp,
+    floor: bool,
+) -> Result<Vec<f32>> {
     ensure_same_len(semantics, axis)?;
     if gain == 0.0 {
         return Ok(semantics.to_vec());
     }
+    let clamped = if floor {
+        clamp_alpha(gain)
+    } else {
+        clamp_alpha_share(gain)
+    };
     if gain > 0.0 {
         // Amplify along axis — still not a mass change.
         let d = normalize(axis)?;
-        let scale = clamp_alpha(gain).abs() * norm(semantics);
+        let scale = clamped.abs() * norm(semantics);
         let mut out: Vec<f32> = semantics
             .iter()
             .zip(&d)
@@ -270,8 +296,8 @@ pub fn apply_steering(
         return Ok(out);
     }
 
-    // Negative gain: invert. Strength α = clamp(|gain|) into the measured sweet band.
-    let alpha = clamp_alpha(gain).abs();
+    // Negative gain: invert. Strength α = |clamped|.
+    let alpha = clamped.abs();
     let mut out = match op {
         InversionOp::Polarity => {
             let target = normalize(axis)?;
@@ -397,7 +423,10 @@ mod tests {
         axis[0] = 0.8;
         axis[1] = 0.6;
         let axis = normalize(&axis).unwrap();
-        assert!(cosine(&sem, &axis).unwrap() > 0.5, "axis must share a component");
+        assert!(
+            cosine(&sem, &axis).unwrap() > 0.5,
+            "axis must share a component"
+        );
 
         let mut previous = 1.0f32;
         for alpha in [-0.05f32, -0.15, -0.25, -0.35] {
@@ -410,7 +439,10 @@ mod tests {
             previous = cos;
         }
         // And it stays a rotation, not a collapse to the antipode.
-        assert!(previous > -0.5, "sweet-band α should not reach the antipode, got {previous}");
+        assert!(
+            previous > -0.5,
+            "sweet-band α should not reach the antipode, got {previous}"
+        );
     }
 
     #[test]
@@ -428,6 +460,13 @@ mod tests {
         assert!(mass_from_radiance(1.0, 2.0) > 0.0);
         // Positive mass + high radiance stays positive even if someone later sets gain < 0.
         assert!(mass_from_radiance(0.5, 3.0) > 0.0);
+    }
+
+    #[test]
+    fn clamp_alpha_share_does_not_lift_tiny_shares() {
+        assert!((clamp_alpha_share(0.04).abs() - 0.04).abs() < 1e-6);
+        assert!(clamp_alpha(0.04).abs() >= ALPHA_MIN);
+        assert!(clamp_alpha_share(-0.9).abs() <= ALPHA_MAX);
     }
 
     #[test]

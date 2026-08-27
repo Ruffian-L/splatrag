@@ -54,19 +54,21 @@ input { min-width: 0; outline: none; }
 .quiet, .meta { color: var(--muted); }
 .meta { font-size: 11px; letter-spacing: .03em; }
 .hit { padding: 12px 0; border-top: 1px solid var(--line); }
-.legend { display: inline-flex; align-items: center; gap: 6px; margin-left: 6px; }
+.legend { display: inline-flex; align-items: center; gap: 6px; margin-left: 6px; flex-wrap: wrap; }
 .swatch {
   display: inline-block; width: 10px; height: 10px; border-radius: 50%;
   box-shadow: 0 0 8px currentColor;
 }
-.swatch.scifact { background: #4ec4ff; color: #4ec4ff; }
-.swatch.urban { background: #ff9a3c; color: #ff9a3c; }
-.swatch.hot { background: #fff6a8; color: #fff6a8; }
+/* Honest personal legend — no eval-domain leftovers */
+.swatch.basin { background: #5ee4a8; color: #5ee4a8; }
+.swatch.hit { background: #ffd24a; color: #ffd24a; }
+.swatch.selected { background: #ffffff; color: #ffffff; }
 .swatch.both { background: #78dcff; color: #78dcff; }
-.swatch.bm25 { background: #ffc850; color: #ffc850; }
-.swatch.dense { background: #b478ff; color: #b478ff; }
-.swatch.fusion { background: #ff5a78; color: #ff5a78; }
-#dream-btn, #miss-btn { margin-left: 4px; }
+#dream-btn { margin-left: 4px; }
+#dream-btn:disabled { opacity: 0.55; cursor: wait; }
+.recall-hit { cursor: pointer; border-radius: 8px; padding: 10px 6px; margin: 0 -6px; }
+.recall-hit:hover { background: rgba(109, 232, 255, .06); }
+.recall-hit.top { border-left: 2px solid #fff; padding-left: 10px; }
 .jlens-panel {
   padding: 12px 14px; margin-bottom: 12px; border: 1px solid rgba(255, 200, 120, .28);
   border-radius: 12px; background: linear-gradient(160deg, rgba(40, 28, 12, .75), rgba(10, 18, 28, .7));

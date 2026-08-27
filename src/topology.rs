@@ -1,3 +1,4 @@
+use crate::ann::KeyedAnn;
 use crate::config::PhysicsConfig;
 use crate::geometry::{Basin, Splat, cosine};
 use chrono::Utc;
@@ -18,14 +19,26 @@ pub fn discover_basins(
     splats: &mut [Splat],
     previous: &[Basin],
     config: &PhysicsConfig,
+    ann: Option<&KeyedAnn>,
 ) -> (Vec<Basin>, Vec<PersistenceInterval>) {
-    let edges = spatial_semantic_edges(splats, config.basin_radius, config.semantic_threshold);
+    // Pack to 64d geometry. 3D radius percolation was gluing the PCA picture into one well.
+    let edges = hidden_knn_edges(splats, config, ann);
     let mut union = UnionFind::new(splats.len());
     let mut intervals = Vec::new();
+    let min_size = config.min_basin_size.max(1);
+    let core = config.basin_core_cosine.clamp(0.0, 1.0);
     for edge in &edges {
         let left_root = union.find(edge.left);
         let right_root = union.find(edge.right);
         if left_root == right_root {
+            continue;
+        }
+        let left_size = union.size[left_root];
+        let right_size = union.size[right_root];
+        let cosine = (1.0 - edge.distance).clamp(0.0, 1.0);
+        let crumb = left_size < min_size || right_size < min_size;
+        // Two real wells stay two wells unless this edge is a tight 64d core, not a 0.55 bridge.
+        if !crumb && cosine < core {
             continue;
         }
         let (survivor, absorbed) = union.union(left_root, right_root);
@@ -72,7 +85,14 @@ pub fn discover_basins(
             continue;
         }
         members.sort_by_key(|index| splats[*index].memory_id);
-        for chunk in split_overloaded(&members, splats, 5_000) {
+        // Cap is bookkeeping (split_overloaded), not a meaning unit — see research log 2026-08-07.
+        // `basin_max_members = 0` means no axis-split bags: keep the geometric component intact.
+        let max_members = if config.basin_max_members == 0 {
+            usize::MAX
+        } else {
+            config.basin_max_members.max(config.min_basin_size)
+        };
+        for chunk in split_overloaded(&members, splats, max_members) {
             let ids: Vec<_> = chunk.iter().map(|index| splats[*index].memory_id).collect();
             let id_set: HashSet<_> = ids.iter().copied().collect();
             let mut best_previous = None;
@@ -170,8 +190,160 @@ pub fn discover_basins(
         }
     }
 
+    attach_crumbs(splats, &mut basins, config, ann);
+
     basins.sort_by(|a, b| a.id.cmp(&b.id));
     (basins, intervals)
+}
+
+/// Gaussian falloff: a crumb joins the nearest existing well. Never unions two wells.
+fn attach_crumbs(
+    splats: &mut [Splat],
+    basins: &mut [Basin],
+    config: &PhysicsConfig,
+    ann: Option<&KeyedAnn>,
+) {
+    let attach = config.basin_attach_cosine;
+    if attach <= 0.0 || basins.is_empty() {
+        return;
+    }
+    let mut basin_index: HashMap<String, usize> = HashMap::new();
+    for (index, basin) in basins.iter().enumerate() {
+        basin_index.insert(basin.id.clone(), index);
+    }
+    let id_to_index: HashMap<Uuid, usize> = splats
+        .iter()
+        .enumerate()
+        .map(|(index, splat)| (splat.memory_id, index))
+        .collect();
+    let assigned: Vec<usize> = splats
+        .iter()
+        .enumerate()
+        .filter(|(_, splat)| !splat.muted && splat.basin_id.is_some())
+        .map(|(index, _)| index)
+        .collect();
+    if assigned.is_empty() {
+        return;
+    }
+
+    let mut grown: HashSet<usize> = HashSet::new();
+    for index in 0..splats.len() {
+        if splats[index].muted || splats[index].basin_locked || splats[index].basin_id.is_some() {
+            continue;
+        }
+        if let Some(basin_id) =
+            best_basin_for(splats, index, attach, config, ann, &id_to_index, &assigned)
+        {
+            assign_to_basin(splats, basins, &basin_index, &mut grown, index, &basin_id);
+        }
+    }
+
+    for basin_i in grown {
+        refresh_basin(&mut basins[basin_i], splats, config);
+    }
+}
+
+/// Strongest well for crumb `index` over its candidate neighbors: the ANN graph when one
+/// was passed, else every already-assigned splat. Returns the basin id of the best cosine
+/// at or above `attach`, if any.
+fn best_basin_for(
+    splats: &[Splat],
+    index: usize,
+    attach: f32,
+    config: &PhysicsConfig,
+    ann: Option<&KeyedAnn>,
+    id_to_index: &HashMap<Uuid, usize>,
+    assigned: &[usize],
+) -> Option<String> {
+    let mut best_cosine = f32::NEG_INFINITY;
+    let mut best_basin: Option<String> = None;
+
+    let mut consider = |other: usize| {
+        if other == index {
+            return;
+        }
+        let Some(basin_id) = splats[other].basin_id.clone() else {
+            return;
+        };
+        let cosine_value = cosine(&splats[index].semantics, &splats[other].semantics);
+        if cosine_value >= attach && cosine_value > best_cosine {
+            best_cosine = cosine_value;
+            best_basin = Some(basin_id);
+        }
+    };
+
+    if let Some(ann) = ann {
+        let neighbors = ann
+            .neighbors_for_key(splats[index].memory_id)
+            .unwrap_or_default();
+        for id in neighbors.into_iter().take(config.basin_knn.max(8) * 4) {
+            if let Some(&other) = id_to_index.get(&id) {
+                consider(other);
+            }
+        }
+    } else {
+        for &other in assigned {
+            consider(other);
+        }
+    }
+
+    best_basin
+}
+
+/// Attach crumb `index` to `basin_id` and grow the basin's member list when the crumb is
+/// new to it. The splat keeps the assignment even if the basin id has no shell basin.
+fn assign_to_basin(
+    splats: &mut [Splat],
+    basins: &mut [Basin],
+    basin_index: &HashMap<String, usize>,
+    grown: &mut HashSet<usize>,
+    index: usize,
+    basin_id: &str,
+) {
+    splats[index].basin_id = Some(basin_id.to_string());
+    if let Some(&basin_i) = basin_index.get(basin_id) {
+        let id = splats[index].memory_id;
+        if !basins[basin_i].member_ids.contains(&id) {
+            basins[basin_i].member_ids.push(id);
+            grown.insert(basin_i);
+        }
+    }
+}
+
+fn refresh_basin(basin: &mut Basin, splats: &[Splat], config: &PhysicsConfig) {
+    let id_to_index: HashMap<Uuid, usize> = splats
+        .iter()
+        .enumerate()
+        .map(|(index, splat)| (splat.memory_id, index))
+        .collect();
+    let members: Vec<usize> = basin
+        .member_ids
+        .iter()
+        .filter_map(|id| id_to_index.get(id).copied())
+        .collect();
+    if members.is_empty() {
+        return;
+    }
+    basin.centroid = centroid(&members, splats);
+    let spread = members
+        .iter()
+        .map(|index| distance(splats[*index].position, basin.centroid))
+        .sum::<f32>()
+        / members.len() as f32;
+    basin.stability = (1.0 - spread / (config.basin_radius * 3.0)).clamp(0.0, 1.0);
+    let mut representatives = members;
+    representatives.sort_by(|left, right| {
+        splats[*right]
+            .radiance
+            .total_cmp(&splats[*left].radiance)
+            .then_with(|| splats[*left].memory_id.cmp(&splats[*right].memory_id))
+    });
+    basin.representative_ids = representatives
+        .into_iter()
+        .take(12)
+        .map(|index| splats[index].memory_id)
+        .collect();
+    basin.updated_at = Utc::now();
 }
 
 #[derive(Debug, Clone)]
@@ -181,45 +353,88 @@ struct Edge {
     distance: f32,
 }
 
-fn spatial_semantic_edges(splats: &[Splat], radius: f32, semantic_threshold: f32) -> Vec<Edge> {
-    let cell_size = radius.max(0.001);
-    let mut cells: HashMap<(i32, i32, i32), Vec<usize>> = HashMap::new();
-    for (index, splat) in splats.iter().enumerate() {
-        cells
-            .entry(cell(splat.position, cell_size))
-            .or_default()
-            .push(index);
+/// 64d k-NN edges. `distance` is `1 - cosine` so Kruskal packs tight wells first.
+fn hidden_knn_edges(splats: &[Splat], config: &PhysicsConfig, ann: Option<&KeyedAnn>) -> Vec<Edge> {
+    // 0.55 is the dream force-neutral, not a basin edge. On Qwen3 SciFact, random
+    // paper–paper cosine p90 is ~0.55, so that gate percolates the whole science
+    // manifold. Pack wells at `basin_core_cosine` (the tight 64d neighborhood).
+    let threshold = config.basin_core_cosine.max(config.semantic_threshold);
+    let live: Vec<usize> = splats
+        .iter()
+        .enumerate()
+        .filter(|(_, splat)| !splat.muted)
+        .map(|(index, _)| index)
+        .collect();
+    if live.len() < 2 {
+        return Vec::new();
     }
+    let k = if config.basin_knn == 0 {
+        live.len().saturating_sub(1)
+    } else {
+        config.basin_knn.max(1).min(live.len() - 1)
+    };
+    let mut seen = HashSet::new();
     let mut edges = Vec::new();
-    for (index, splat) in splats.iter().enumerate() {
-        let origin = cell(splat.position, cell_size);
-        for dx in -1..=1 {
-            for dy in -1..=1 {
-                for dz in -1..=1 {
-                    if let Some(neighbors) =
-                        cells.get(&(origin.0 + dx, origin.1 + dy, origin.2 + dz))
-                    {
-                        for &other in neighbors {
-                            if other <= index {
-                                continue;
-                            }
-                            let distance = distance(splat.position, splats[other].position);
-                            if distance <= radius
-                                && cosine(&splat.semantics, &splats[other].semantics)
-                                    >= semantic_threshold
-                            {
-                                edges.push(Edge {
-                                    left: index,
-                                    right: other,
-                                    distance,
-                                });
-                            }
-                        }
-                    }
+    let mut push = |left: usize, right: usize, cosine_value: f32| {
+        if left == right || cosine_value < threshold {
+            return;
+        }
+        let (left, right) = if left < right {
+            (left, right)
+        } else {
+            (right, left)
+        };
+        if !seen.insert((left, right)) {
+            return;
+        }
+        edges.push(Edge {
+            left,
+            right,
+            distance: (1.0 - cosine_value).clamp(0.0, 2.0),
+        });
+    };
+
+    if let Some(ann) = ann {
+        let id_to_index: HashMap<Uuid, usize> = splats
+            .iter()
+            .enumerate()
+            .map(|(index, splat)| (splat.memory_id, index))
+            .collect();
+        for &index in &live {
+            let neighbors = ann
+                .neighbors_for_key(splats[index].memory_id)
+                .unwrap_or_default();
+            for id in neighbors.into_iter().take(k) {
+                let Some(&other) = id_to_index.get(&id) else {
+                    continue;
+                };
+                if splats[other].muted {
+                    continue;
                 }
+                let cosine_value = cosine(&splats[index].semantics, &splats[other].semantics);
+                push(index, other, cosine_value);
+            }
+        }
+    } else {
+        for (rank, &index) in live.iter().enumerate() {
+            let mut scored: Vec<(f32, usize)> = live
+                .iter()
+                .enumerate()
+                .filter(|(other_rank, _)| *other_rank != rank)
+                .map(|(_, &other)| {
+                    (
+                        cosine(&splats[index].semantics, &splats[other].semantics),
+                        other,
+                    )
+                })
+                .collect();
+            scored.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+            for (cosine_value, other) in scored.into_iter().take(k) {
+                push(index, other, cosine_value);
             }
         }
     }
+
     edges.sort_by(|a, b| {
         a.distance
             .total_cmp(&b.distance)
@@ -288,14 +503,6 @@ fn centroid(indices: &[usize], splats: &[Splat]) -> [f32; 3] {
     center
 }
 
-fn cell(position: [f32; 3], size: f32) -> (i32, i32, i32) {
-    (
-        (position[0] / size).floor() as i32,
-        (position[1] / size).floor() as i32,
-        (position[2] / size).floor() as i32,
-    )
-}
-
 fn distance(a: [f32; 3], b: [f32; 3]) -> f32 {
     ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
 }
@@ -340,42 +547,137 @@ impl UnionFind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
-    fn splat(id: u128, x: f32) -> Splat {
+    fn splat(id: u128, position: [f32; 3], axis: usize) -> Splat {
+        let mut semantics = vec![0.0; 64];
+        semantics[axis] = 1.0;
         Splat {
             memory_id: Uuid::from_u128(id),
-            semantics: vec![0.125; 64],
-            position: [x, 0.0, 0.0],
+            semantics,
+            position,
             velocity: [0.0; 3],
             scale: [1.0; 3],
             rotation: [0.0, 0.0, 0.0, 1.0],
             color_rgba: [255; 4],
             mass: 1.0,
             radiance: 1.0,
+            usage: 0.0,
+            conductivity: 1.0,
             gain: 0.0,
             basin_locked: false,
+            muted: false,
+            duplicate_count: 1,
             domain: "chat".into(),
             basin_id: None,
             lineage: vec![],
         }
     }
 
-    #[test]
-    fn h0_components_separate_distant_groups() {
-        let mut splats = vec![
-            splat(1, 0.0),
-            splat(2, 0.1),
-            splat(3, 0.2),
-            splat(4, 5.0),
-            splat(5, 5.1),
-            splat(6, 5.2),
-        ];
-        let config = PhysicsConfig {
-            basin_radius: 0.5,
+    fn config() -> PhysicsConfig {
+        PhysicsConfig {
+            basin_knn: 8,
+            basin_core_cosine: 0.75,
+            min_basin_size: 3,
+            semantic_threshold: 0.55,
             ..PhysicsConfig::default()
-        };
-        let (basins, intervals) = discover_basins(&mut splats, &[], &config);
+        }
+    }
+
+    #[test]
+    fn hd_clusters_split_even_when_positions_mash() {
+        // Two 64d modes sitting in the same 3D cell — the picture is soup, the hidden vectors are not.
+        let mut splats = vec![
+            splat(1, [0.0, 0.0, 0.0], 0),
+            splat(2, [0.05, 0.0, 0.0], 0),
+            splat(3, [0.1, 0.0, 0.0], 0),
+            splat(4, [0.0, 0.0, 0.0], 1),
+            splat(5, [0.05, 0.0, 0.0], 1),
+            splat(6, [0.1, 0.0, 0.0], 1),
+        ];
+        let (basins, _) = discover_basins(&mut splats, &[], &config(), None);
+        assert_eq!(
+            basins.len(),
+            2,
+            "got {:?}",
+            basins
+                .iter()
+                .map(|b| b.member_ids.len())
+                .collect::<Vec<_>>()
+        );
+        let axes: Vec<_> = basins
+            .iter()
+            .map(|basin| {
+                basin
+                    .member_ids
+                    .iter()
+                    .filter_map(|id| splats.iter().find(|s| s.memory_id == *id))
+                    .map(|s| s.semantics.iter().position(|v| *v > 0.5).unwrap())
+                    .collect::<HashSet<_>>()
+            })
+            .collect();
+        assert!(axes.iter().all(|set| set.len() == 1));
+    }
+
+    #[test]
+    fn same_hidden_vector_packs_across_split_positions() {
+        let mut splats = vec![
+            splat(1, [0.0, 0.0, 0.0], 0),
+            splat(2, [0.1, 0.0, 0.0], 0),
+            splat(3, [0.2, 0.0, 0.0], 0),
+            splat(4, [50.0, 0.0, 0.0], 0),
+            splat(5, [50.1, 0.0, 0.0], 0),
+            splat(6, [50.2, 0.0, 0.0], 0),
+        ];
+        let (basins, _) = discover_basins(&mut splats, &[], &config(), None);
+        assert_eq!(basins.len(), 1);
+        assert_eq!(basins[0].member_ids.len(), 6);
+    }
+
+    #[test]
+    fn weak_bridge_does_not_glue_two_cores() {
+        let mut bridge = splat(7, [0.0, 0.0, 0.0], 0);
+        bridge.semantics[0] = 0.7;
+        bridge.semantics[1] = 0.7;
+        let mut splats = vec![
+            splat(1, [0.0; 3], 0),
+            splat(2, [0.0; 3], 0),
+            splat(3, [0.0; 3], 0),
+            splat(4, [0.0; 3], 1),
+            splat(5, [0.0; 3], 1),
+            splat(6, [0.0; 3], 1),
+            bridge,
+        ];
+        let (basins, _) = discover_basins(&mut splats, &[], &config(), None);
         assert_eq!(basins.len(), 2);
-        assert_eq!(intervals.len(), 4);
+    }
+
+    #[test]
+    fn crumb_attaches_to_nearest_core_without_merging() {
+        let mut crumb = splat(7, [0.0; 3], 0);
+        crumb.semantics[0] = 0.73;
+        crumb.semantics[1] = (1.0 - 0.73 * 0.73_f32).sqrt();
+        let mut splats = vec![
+            splat(1, [0.0; 3], 0),
+            splat(2, [0.0; 3], 0),
+            splat(3, [0.0; 3], 0),
+            splat(4, [0.0; 3], 1),
+            splat(5, [0.0; 3], 1),
+            splat(6, [0.0; 3], 1),
+            crumb,
+        ];
+        let (basins, _) = discover_basins(&mut splats, &[], &config(), None);
+        assert_eq!(basins.len(), 2);
+        let sizes: Vec<usize> = {
+            let mut s: Vec<usize> = basins.iter().map(|b| b.member_ids.len()).collect();
+            s.sort();
+            s
+        };
+        assert_eq!(
+            sizes,
+            vec![3, 4],
+            "crumb should join one well, not glue both: {sizes:?}"
+        );
+        assert_eq!(splats[6].basin_id, splats[0].basin_id);
     }
 }

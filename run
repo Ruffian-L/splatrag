@@ -1,0 +1,257 @@
+#!/usr/bin/env bash
+# SplatRAG — one surface for the local stack.
+#
+#   ./run                 what is up and what is not
+#   ./run init            create .env and splatrag.toml from the templates
+#   ./run up              embedder + service, then print the URLs
+#   ./run serve           just the service (viewer + HTTP API + agent tools)
+#   ./run embed           just the embedding model
+#   ./run label           just the labeler (optional; names your basins)
+#   ./run palace          the TanStack frontend, if you have it
+#   ./run open            open the viewer in a browser
+#   ./run stop            stop the service and frontend, keep the models loaded
+#   ./run stop-all        stop everything this script started
+#   ./run claim [flags]   reproduce the benchmark claim  → ./claim.sh
+#
+# Anything else is passed to the engine with your config:
+#
+#   ./run recall "what did we decide about clustering?"
+#   ./run remember "the poison corpus is 5000 urban dictionary entries"
+#   ./run ingest --source claude ~/exports/conversations.json
+#   ./run dream --label
+#   ./run status
+#   ./run doctor
+#   ./run mcp             stdio MCP server, for agent clients that spawn a process
+#
+set -uo pipefail
+
+SR_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/scripts/lib.sh"
+# shellcheck source=scripts/lib.sh
+. "$SR_LIB"
+sr_load_env
+
+usage() {
+  awk 'NR>1 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "$0"
+  cat <<EOF
+
+Config
+  config      $SPLATRAG_CONFIG
+  runtime     $SPLATRAG_RUNTIME
+  logs        $SPLATRAG_LOGS
+  ports       embed :$SPLATRAG_EMBED_PORT · label :$SPLATRAG_LABEL_PORT · service :$SPLATRAG_LENS_PORT
+
+Everything above is set in .env — see .env.example. Start with: ./run init
+EOF
+}
+
+# --- init --------------------------------------------------------------------
+
+cmd_init() {
+  local force=0
+  [[ "${1:-}" == "--force" ]] && force=1
+
+  step "init"
+  if [[ -f "$SR_ROOT/.env" && $force -eq 0 ]]; then
+    ok ".env exists (--force to overwrite)"
+  else
+    cp "$SR_ROOT/.env.example" "$SR_ROOT/.env"
+    ok "wrote .env — every value is commented out and has a working default"
+  fi
+
+  if [[ -f "$SPLATRAG_CONFIG" && $force -eq 0 ]]; then
+    ok "$(basename "$SPLATRAG_CONFIG") exists (--force to overwrite)"
+  else
+    mkdir -p "$SPLATRAG_RUNTIME/stores"
+    sed -e "s|__DATA_DIR__|$SPLATRAG_RUNTIME/stores/data|g" \
+        -e "s|__SCOPE_KEY__|splatrag-main|g" \
+        -e "s|__EMBED_URL__|http://127.0.0.1:$SPLATRAG_EMBED_PORT|g" \
+        -e "s|__LABEL_URL__|http://127.0.0.1:$SPLATRAG_LABEL_PORT|g" \
+        -e "s|__BIND__|127.0.0.1:$SPLATRAG_LENS_PORT|g" \
+        "$SR_ROOT/configs/serve.toml.in" >"$SPLATRAG_CONFIG"
+    ok "wrote $(basename "$SPLATRAG_CONFIG")  → store at $SPLATRAG_RUNTIME/stores/data"
+  fi
+
+  echo
+  c_dim "  next:  ./run up        (starts the embedder, then the service)"
+  c_dim "         ./run claim     (reproduce the benchmark instead)"
+}
+
+# --- service -----------------------------------------------------------------
+
+start_serve() {
+  if api_up "$SPLATRAG_LENS_PORT"; then
+    ok "service :$SPLATRAG_LENS_PORT already up"
+    return 0
+  fi
+  if port_listening "$SPLATRAG_LENS_PORT"; then
+    bad ":$SPLATRAG_LENS_PORT is in use but /api/status does not answer"
+    note "log: $SPLATRAG_LOGS/serve-${SPLATRAG_LENS_PORT}.log"
+    return 1
+  fi
+  ensure_bin || return 1
+  if [[ ! -f "$SPLATRAG_CONFIG" ]]; then
+    bad "no config at $SPLATRAG_CONFIG"
+    note "run: ./run init"
+    return 1
+  fi
+  note "starting service → :$SPLATRAG_LENS_PORT"
+  nohup "$SPLATRAG_BIN" --config "$SPLATRAG_CONFIG" serve \
+    >"$SPLATRAG_LOGS/serve-${SPLATRAG_LENS_PORT}.log" 2>&1 &
+  echo $! >"$SPLATRAG_LOGS/serve.pid"
+  for _ in $(seq 40); do
+    if api_up "$SPLATRAG_LENS_PORT"; then
+      ok "service  http://127.0.0.1:$SPLATRAG_LENS_PORT"
+      return 0
+    fi
+    sleep 0.5
+  done
+  bad "service failed to start"
+  tail -20 "$SPLATRAG_LOGS/serve-${SPLATRAG_LENS_PORT}.log" 2>/dev/null | sed 's/^/      /'
+  return 1
+}
+
+start_palace() {
+  if http_ok "$SPLATRAG_PALACE_PORT"; then
+    ok "frontend :$SPLATRAG_PALACE_PORT already up"
+    return 0
+  fi
+  if [[ ! -f "$SPLATRAG_PALACE_DIR/package.json" ]]; then
+    warn "no frontend app at $SPLATRAG_PALACE_DIR"
+    note "set SPLATRAG_PALACE_DIR in .env, or just use the built-in viewer at /"
+    return 1
+  fi
+  have npm || { bad "npm not found — Node 22+ required for the frontend"; return 1; }
+  if [[ ! -d "$SPLATRAG_PALACE_DIR/node_modules" ]]; then
+    note "npm install (first run)"
+    (cd "$SPLATRAG_PALACE_DIR" && npm install) || return 1
+  fi
+  note "starting frontend :$SPLATRAG_PALACE_PORT → service :$SPLATRAG_LENS_PORT"
+  (
+    cd "$SPLATRAG_PALACE_DIR" || exit 1
+    export SPALTRAG_API_URL="http://127.0.0.1:$SPLATRAG_LENS_PORT"
+    nohup npm run dev >"$SPLATRAG_LOGS/palace-${SPLATRAG_PALACE_PORT}.log" 2>&1 &
+    echo $! >"$SPLATRAG_LOGS/palace.pid"
+  )
+  printf '    waiting'
+  for _ in $(seq 60); do
+    if http_ok "$SPLATRAG_PALACE_PORT"; then
+      echo
+      ok "frontend  http://127.0.0.1:$SPLATRAG_PALACE_PORT/palace"
+      return 0
+    fi
+    printf '.'
+    sleep 1
+  done
+  echo
+  bad "frontend failed — see $SPLATRAG_LOGS/palace-${SPLATRAG_PALACE_PORT}.log"
+  return 1
+}
+
+# --- status ------------------------------------------------------------------
+
+cmd_status() {
+  step "splatrag"
+  if health_up "$SPLATRAG_EMBED_PORT"; then
+    ok "embedder  :$SPLATRAG_EMBED_PORT  up"
+  else
+    bad "embedder  :$SPLATRAG_EMBED_PORT  down     → ./run embed"
+  fi
+
+  if health_up "$SPLATRAG_LABEL_PORT"; then
+    ok "labeler   :$SPLATRAG_LABEL_PORT  up"
+  else
+    c_dim "    · labeler   :$SPLATRAG_LABEL_PORT  down     → ./run label   (optional)"
+  fi
+
+  if api_up "$SPLATRAG_LENS_PORT"; then
+    ok "service   :$SPLATRAG_LENS_PORT  up       http://127.0.0.1:$SPLATRAG_LENS_PORT"
+    curl -s --max-time 3 "http://127.0.0.1:$SPLATRAG_LENS_PORT/api/status" 2>/dev/null \
+      | python3 -c 'import json,sys
+try:
+    s = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+print("      %s memories · %s splats · %s basins · dream %s · scope %s" % (
+    s.get("cold_records"), s.get("splats"), s.get("basins"),
+    s.get("dream_cycle"), s.get("scope_key")))' 2>/dev/null || true
+  else
+    bad "service   :$SPLATRAG_LENS_PORT  down     → ./run serve"
+  fi
+
+  if http_ok "$SPLATRAG_PALACE_PORT"; then
+    ok "frontend  :$SPLATRAG_PALACE_PORT  up       http://127.0.0.1:$SPLATRAG_PALACE_PORT/palace"
+  else
+    c_dim "    · frontend  :$SPLATRAG_PALACE_PORT  down     → ./run palace  (optional)"
+  fi
+
+  echo
+  c_dim "  config $SPLATRAG_CONFIG"
+  c_dim "  logs   $SPLATRAG_LOGS"
+  [[ -f "$SPLATRAG_CONFIG" ]] || c_dim "  no config yet → ./run init"
+}
+
+cmd_open() {
+  local url="http://127.0.0.1:$SPLATRAG_LENS_PORT"
+  http_ok "$SPLATRAG_PALACE_PORT" && url="http://127.0.0.1:$SPLATRAG_PALACE_PORT/palace"
+  echo "$url"
+  if have xdg-open; then
+    xdg-open "$url" >/dev/null 2>&1 || true
+  fi
+}
+
+cmd_up() {
+  start_embed || return 1
+  start_serve || return 1
+  echo
+  ok "viewer      http://127.0.0.1:$SPLATRAG_LENS_PORT"
+  ok "agent tools http://127.0.0.1:$SPLATRAG_LENS_PORT/api/tools"
+  c_dim "  ./run recall \"…\"    search from the shell"
+  c_dim "  ./run stop-all       shut it down"
+}
+
+cmd_stop() {
+  stop_port_listeners "$SPLATRAG_PALACE_PORT"; ok "frontend stopped"
+  stop_port_listeners "$SPLATRAG_LENS_PORT";   ok "service stopped"
+}
+
+cmd_stop_all() {
+  cmd_stop
+  stop_port_listeners "$SPLATRAG_EMBED_PORT"; ok "embedder stopped"
+  stop_port_listeners "$SPLATRAG_LABEL_PORT"; ok "labeler stopped"
+}
+
+passthrough() {
+  ensure_bin || exit 1
+  if [[ ! -f "$SPLATRAG_CONFIG" ]]; then
+    bad "no config at $SPLATRAG_CONFIG — run: ./run init"
+    exit 1
+  fi
+  exec "$SPLATRAG_BIN" --config "$SPLATRAG_CONFIG" "$@"
+}
+
+# --- dispatch ----------------------------------------------------------------
+
+main() {
+  local cmd="${1:-status}"
+  shift || true
+  case "$cmd" in
+    status|st)           cmd_status ;;
+    init)                cmd_init "$@" ;;
+    up|start)            cmd_up ;;
+    serve|lens|viewer)   start_serve ;;
+    embed|embedder)      start_embed ;;
+    label|labeler)       start_label ;;
+    palace|ui|frontend)  start_palace ;;
+    open|browse)         cmd_open ;;
+    stop)                cmd_stop ;;
+    stop-all|down)       cmd_stop_all ;;
+    claim)               exec "$SR_ROOT/claim.sh" "$@" ;;
+    pack-frontend)       exec "$SR_ROOT/scripts/pack_frontend.sh" "$@" ;;
+    -h|--help|help)      usage ;;
+    # Engine subcommands, by their clap names. Anything unrecognised also goes to
+    # the engine, so new subcommands work here without editing this script.
+    *)                   passthrough "$cmd" "$@" ;;
+  esac
+}
+
+main "$@"

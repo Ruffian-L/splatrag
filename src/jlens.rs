@@ -14,7 +14,7 @@
 //! - `JLENS_RAW=1` — skip chat wrap; unembed raw prompt end (continuation lens)
 //! - `JLENS_FORCE_CUDA=1` — only when CUDA jlens build is known good
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -82,10 +82,7 @@ fn default_tokenizer() -> Option<PathBuf> {
         return Some(PathBuf::from(p));
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    for rel in [
-        "models/tokenizer.json",
-        ".cache/models/tokenizer.json",
-    ] {
+    for rel in ["models/tokenizer.json", ".cache/models/tokenizer.json"] {
         let p = PathBuf::from(&home).join(rel);
         if p.exists() {
             return Some(p);
@@ -120,13 +117,15 @@ fn first_thought_prompt(user_text: &str) -> String {
     if body.contains("<start_of_turn>") {
         return body.to_string();
     }
-    format!(
-        "<start_of_turn>user\n{body}\n<end_of_turn>\n<start_of_turn>model\n"
-    )
+    format!("<start_of_turn>user\n{body}\n<end_of_turn>\n<start_of_turn>model\n")
 }
 
 /// Run jlens-gguf readout once; parse last JSONL record from stdout (or emit file).
-pub async fn readout_verbalizable(prompt: &str, top_k: usize, verify: bool) -> Result<JlensReadout> {
+pub async fn readout_verbalizable(
+    prompt: &str,
+    top_k: usize,
+    verify: bool,
+) -> Result<JlensReadout> {
     let bin = default_bin();
     let model = default_model();
     if !bin.exists() {
@@ -140,7 +139,7 @@ pub async fn readout_verbalizable(prompt: &str, top_k: usize, verify: bool) -> R
     }
 
     let layers = std::env::var("JLENS_LAYERS").unwrap_or_else(|_| "last".into());
-    let top_k = top_k.max(1).min(32);
+    let top_k = top_k.clamp(1, 32);
     let raw_mode = std::env::var("JLENS_RAW").ok().as_deref() == Some("1");
     let lens_prompt = if raw_mode {
         prompt.to_string()
@@ -216,11 +215,7 @@ pub async fn readout_verbalizable(prompt: &str, top_k: usize, verify: bool) -> R
             position: None,
             model_path: model.display().to_string(),
             note: "jlens readout failed".into(),
-            error: Some(format!(
-                "exit {:?} — {}",
-                output.status.code(),
-                stderr_tail
-            )),
+            error: Some(format!("exit {:?} — {}", output.status.code(), stderr_tail)),
             raw_stderr_tail: Some(stderr_tail),
         });
     }

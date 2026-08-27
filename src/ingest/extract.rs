@@ -153,7 +153,11 @@ const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz
 pub fn base64_encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
         out.push(BASE64[(n >> 18) as usize & 63] as char);
         out.push(BASE64[(n >> 12) as usize & 63] as char);
@@ -320,7 +324,11 @@ mod tests {
     fn html_assets_are_stripped_to_text() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("content");
-        fs::write(&path, "<p>Based on the <strong>sources</strong>, the correlation</p>").unwrap();
+        fs::write(
+            &path,
+            "<p>Based on the <strong>sources</strong>, the correlation</p>",
+        )
+        .unwrap();
         let extracted = extract("asset-1", &path).unwrap();
         assert_eq!(extracted.kind, MediaKind::Html);
         assert_eq!(
@@ -335,7 +343,10 @@ mod tests {
         let path = temp.path().join("content");
         fs::write(&path, b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR").unwrap();
         let extracted = extract("asset-2", &path).unwrap();
-        assert!(extracted.text.is_none(), "OCR is a later pass, not a failure");
+        assert!(
+            extracted.text.is_none(),
+            "OCR is a later pass, not a failure"
+        );
         assert_eq!(extracted.media_type, "image/png");
         assert_eq!(extracted.sha256.len(), 64);
     }

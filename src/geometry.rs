@@ -21,6 +21,14 @@ pub struct SplatGeometry {
     pub physics_props: [u8; 4],
 }
 
+fn one() -> u32 {
+    1
+}
+
+fn default_conductivity() -> f32 {
+    1.0
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Splat {
     pub memory_id: Uuid,
@@ -32,6 +40,13 @@ pub struct Splat {
     pub color_rgba: [u8; 4],
     pub mass: f32,
     pub radiance: f32,
+    /// Retrieval-usage pheromone (τ). Not radiance — radiance is dream connectivity
+    /// and is a constant on a settled field. Missing on old stores → 0.
+    #[serde(default)]
+    pub usage: f32,
+    /// Slime-mold tube thickness (D). Missing on old stores → 1.
+    #[serde(default = "default_conductivity")]
+    pub conductivity: f32,
     /// Steering α applied to **semantics only**, and **0.0 means unsteered**.
     /// Positive amplifies along the concept axis; negative runs ontological inversion
     /// (the sorrowful flip). Does **not** set mass — negative mass is a separate knob
@@ -45,6 +60,17 @@ pub struct Splat {
     /// When true, dream/basin discovery must not reassign `basin_id`.
     #[serde(default)]
     pub basin_locked: bool,
+    /// Set by dream's duplicate collapse: this splat's text is byte-identical to a
+    /// representative that stays active, so it exerts and receives no force, joins no
+    /// basin, and leaves the served field. The record is untouched in cold and the key
+    /// is still in the ANN index — muting is reversible, deletion would not be.
+    #[serde(default)]
+    pub muted: bool,
+    /// How many byte-identical cold records this splat stands for (1 = unique).
+    /// Only ever > 1 on a representative. The absorbed ids stay recoverable from cold
+    /// by this splat's `content_sha256`, so they are not duplicated into `lineage`.
+    #[serde(default = "one")]
+    pub duplicate_count: u32,
     pub domain: String,
     pub basin_id: Option<String>,
     #[serde(default)]
@@ -101,13 +127,24 @@ const TARGET_RMS_RADIUS: f32 = 4.0;
 
 impl Projection {
     pub fn fit(splats: &[Splat]) -> Option<Self> {
+        // Muted copies are out of the field. Fitting on them lets a takeout-footer
+        // clump own the 3-d axes and pack the live memories into its well.
+        let live: Vec<&Splat> = splats.iter().filter(|splat| !splat.muted).collect();
+        if live.len() >= 3 {
+            Self::fit_from(live)
+        } else {
+            Self::fit_from(splats.iter().collect())
+        }
+    }
+
+    fn fit_from(splats: Vec<&Splat>) -> Option<Self> {
         let dim = splats.first()?.semantics.len();
         if splats.len() < 3 || dim == 0 {
             return None;
         }
         let count = splats.len() as f32;
         let mut mean = vec![0.0_f32; dim];
-        for splat in splats {
+        for splat in &splats {
             for (slot, value) in mean.iter_mut().zip(&splat.semantics) {
                 *slot += value;
             }
@@ -119,7 +156,7 @@ impl Projection {
         // f64 for the covariance: these are 64 sums over the whole corpus, and f32 accumulation
         // loses enough precision on the trailing eigenvalues to reorder nearly-tied axes.
         let mut covariance = DMatrix::<f64>::zeros(dim, dim);
-        for splat in splats {
+        for splat in &splats {
             let centered = DVector::<f64>::from_iterator(
                 dim,
                 splat
@@ -134,9 +171,7 @@ impl Projection {
 
         let eigen = SymmetricEigen::new(covariance);
         let mut order: Vec<usize> = (0..dim).collect();
-        order.sort_by(|left, right| {
-            eigen.eigenvalues[*right].total_cmp(&eigen.eigenvalues[*left])
-        });
+        order.sort_by(|left, right| eigen.eigenvalues[*right].total_cmp(&eigen.eigenvalues[*left]));
         let basis: Vec<Vec<f32>> = order
             .iter()
             .take(3)
@@ -222,12 +257,18 @@ impl Splat {
             color_rgba: domain_color(&record.domain),
             mass: 1.0,
             radiance: 1.0,
+            usage: 0.0,
+            conductivity: 1.0,
             // Unsteered. Mass keeps 1.0 as its neutral (it is a physics multiplier);
             // gain is a steering α, so its neutral is zero. Different meanings, different
             // neutrals — conflating them is what made every fresh splat read as
             // "amplified" to downstream consumers.
             gain: 0.0,
             basin_locked: false,
+            // A fresh splat is active and stands only for itself; dream's duplicate
+            // collapse is what decides otherwise, once it can see the whole field.
+            muted: false,
+            duplicate_count: 1,
             domain: record.domain.clone(),
             basin_id: None,
             lineage: vec![record.id],
@@ -371,6 +412,29 @@ impl HotState {
         stale && self.reproject()
     }
 
+    /// True when one basin holds most of the live (unmuted) field.
+    ///
+    /// Duplicate mute takes copies out of physics but leaves the packed 3-d well
+    /// they already built. Dream must reproject in that case or the next run
+    /// settles immediately on the soup.
+    pub fn live_field_is_soup(&self) -> bool {
+        let active = self.splats.iter().filter(|splat| !splat.muted).count();
+        if active < 8 {
+            return false;
+        }
+        let Some(largest) = self
+            .basins
+            .iter()
+            .max_by_key(|basin| basin.member_ids.len())
+        else {
+            return false;
+        };
+        // Majority membership alone is not soup: after a spread-out redream the old
+        // mega id can still hold most ids while stability is ~0 (mean distance >
+        // 3 * basin_radius). Reprojecting that would wipe the geometry we just grew.
+        largest.member_ids.len().saturating_mul(2) > active && largest.stability > 0.25
+    }
+
     pub fn splat_map(&self) -> HashMap<Uuid, &Splat> {
         self.splats
             .iter()
@@ -484,7 +548,7 @@ mod tests {
         assert_eq!(state.splats[0].gain, 0.0);
         assert_eq!(state.splats[1].gain, -0.2);
         assert_eq!(state.splats[2].gain, 0.35);
-        assert!(crate::inversion::ALPHA_MAX < 1.0);
+        const { assert!(crate::inversion::ALPHA_MAX < 1.0) };
 
         // The whole point of the migration: an untouched memory must not look collapse-risky.
         assert!(!crate::inversion::collapse_risk(state.splats[0].gain));
@@ -501,6 +565,140 @@ mod tests {
         assert!(!crate::inversion::collapse_risk(splat.gain));
         // Sign-derived "inverted" flag must not trip on a neutral splat.
         assert_eq!(splat.packed().physics_props[3] & 0b100, 0);
+    }
+
+    #[test]
+    fn pca_fit_ignores_muted_clones() {
+        fn splat(id: u128, semantics: Vec<f32>, muted: bool) -> Splat {
+            Splat {
+                memory_id: Uuid::from_u128(id),
+                semantics,
+                position: [0.0; 3],
+                velocity: [0.0; 3],
+                scale: [1.0; 3],
+                rotation: [0.0, 0.0, 0.0, 1.0],
+                color_rgba: [255; 4],
+                mass: 1.0,
+                radiance: 1.0,
+                usage: 0.0,
+                conductivity: 1.0,
+                gain: 0.0,
+                basin_locked: false,
+                muted,
+                duplicate_count: 1,
+                domain: "chat".into(),
+                basin_id: None,
+                lineage: vec![],
+            }
+        }
+        // Three live memories spread on axis 0; a pile of muted junk on axis 1.
+        let mut splats = vec![
+            splat(
+                1,
+                {
+                    let mut v = vec![0.0; 64];
+                    v[0] = 1.0;
+                    v
+                },
+                false,
+            ),
+            splat(
+                2,
+                {
+                    let mut v = vec![0.0; 64];
+                    v[0] = -1.0;
+                    v
+                },
+                false,
+            ),
+            splat(
+                3,
+                {
+                    let mut v = vec![0.0; 64];
+                    v[0] = 0.2;
+                    v
+                },
+                false,
+            ),
+        ];
+        for i in 0..20 {
+            let mut v = vec![0.0; 64];
+            v[1] = 1.0;
+            splats.push(splat(100 + i, v, true));
+        }
+        let projection = Projection::fit(&splats).expect("fit");
+        assert_eq!(projection.fitted_count, 3);
+        let p0 = projection.apply(&splats[0].semantics);
+        let p1 = projection.apply(&splats[1].semantics);
+        // Live pair must be far apart on the fitted axes, not crushed by the muted pile.
+        let live_span = (p0[0] - p1[0]).abs() + (p0[1] - p1[1]).abs() + (p0[2] - p1[2]).abs();
+        assert!(
+            live_span > 1.0,
+            "unmuted PCA should spread the live pair, got {live_span}"
+        );
+    }
+
+    #[test]
+    fn soup_detects_majority_basin() {
+        let mut state = HotState::default();
+        for i in 0..10u128 {
+            state.splats.push(Splat {
+                memory_id: Uuid::from_u128(i + 1),
+                semantics: vec![0.125; 64],
+                position: [0.0; 3],
+                velocity: [0.0; 3],
+                scale: [1.0; 3],
+                rotation: [0.0, 0.0, 0.0, 1.0],
+                color_rgba: [255; 4],
+                mass: 1.0,
+                radiance: 1.0,
+                usage: 0.0,
+                conductivity: 1.0,
+                gain: 0.0,
+                basin_locked: false,
+                muted: false,
+                duplicate_count: 1,
+                domain: "chat".into(),
+                basin_id: None,
+                lineage: vec![],
+            });
+        }
+        assert!(!state.live_field_is_soup());
+        state.basins.push(Basin {
+            id: "mega".into(),
+            parent_id: None,
+            label: "unlabeled".into(),
+            path: "memory/unlabeled".into(),
+            summary: String::new(),
+            label_state: "pending".into(),
+            stability: 0.5,
+            centroid: [0.0; 3],
+            member_ids: state.splats.iter().take(8).map(|s| s.memory_id).collect(),
+            representative_ids: vec![],
+            updated_at: Utc::now(),
+        });
+        assert!(state.live_field_is_soup());
+        state.basins[0].stability = 0.0;
+        assert!(
+            !state.live_field_is_soup(),
+            "a majority basin with stability 0 is a spread cloud, not a packed well"
+        );
+    }
+
+    #[test]
+    fn old_hot_json_defaults_usage_zero_conductivity_one() {
+        let json = serde_json::json!({
+            "version": 1,
+            "dream_cycle": 0,
+            "last_dream_at": null,
+            "kinetic_energy": 0.0,
+            "basins": [],
+            "splats": [splat_json("00000000-0000-0000-0000-000000000001", 0.0)]
+        });
+        let state: HotState = serde_json::from_value(json).unwrap();
+        assert_eq!(state.splats[0].usage, 0.0);
+        assert_eq!(state.splats[0].conductivity, 1.0);
+        assert_eq!(state.splats[0].radiance, 1.0);
     }
 
     fn splat_json(id: &str, gain: f32) -> serde_json::Value {

@@ -982,7 +982,11 @@ mod tests {
             },
         );
         assert!(!set.picks.is_empty());
-        assert_eq!(set.picks.len(), 4, "limit still counts hits, not extra rooms");
+        assert_eq!(
+            set.picks.len(),
+            4,
+            "limit still counts hits, not extra rooms"
+        );
         assert!(set.picks[0].address.memory_id.is_none());
         assert_eq!(set.picks[0].address.basin_id.as_deref(), Some("basin-a"));
         assert_eq!(set.picks[0].memory_id, a.memory.id);
