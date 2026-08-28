@@ -1949,6 +1949,7 @@ name = "splatrag"
 version = "3.0.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "async-stream",
  "axum",
  "bytemuck",

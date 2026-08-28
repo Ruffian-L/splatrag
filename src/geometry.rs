@@ -7,7 +7,7 @@ use nalgebra::{DMatrix, DVector, SymmetricEigen, UnitQuaternion, Vector3};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{BufReader, Write};
 use std::path::Path;
 use uuid::Uuid;
 
@@ -305,8 +305,8 @@ impl HotState {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let bytes = fs::read(path)?;
-        let mut state: Self = serde_json::from_slice(&bytes)
+        let file = File::open(path)?;
+        let mut state: Self = serde_json::from_reader(BufReader::new(file))
             .with_context(|| format!("invalid hot state {}", path.display()))?;
         state.migrate_neutral_gain();
         Ok(state)

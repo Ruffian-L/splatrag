@@ -83,7 +83,7 @@ where
     let state_muted: Vec<bool> = state.splats.iter().map(|s| s.muted).collect();
     let semantic_neighbors: Vec<Vec<usize>> = state
         .splats
-        .iter()
+        .par_iter()
         .map(|splat| {
             ann.neighbors_for_key(splat.memory_id)
                 .unwrap_or_default()
@@ -126,8 +126,13 @@ where
     );
 
     let previous = state.basins.clone();
-    let (basins, persistence_intervals) =
-        discover_basins(&mut state.splats, &previous, config, Some(ann));
+    let (basins, persistence_intervals) = discover_basins(
+        &mut state.splats,
+        &previous,
+        config,
+        Some(ann),
+        Some(&semantic_neighbors),
+    );
     state.basins = basins;
     {
         let counts: HashMap<String, usize> = state

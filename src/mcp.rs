@@ -375,7 +375,7 @@ async fn handle_proxy(
             "serverInfo": {"name": "splatrag-memory", "version": env!("CARGO_PKG_VERSION")},
             "capabilities": {"tools": {}},
             "instructions": if shared_http {
-                "One SplatRAG MCP server. If you run more than one store, pass silo= on each tool call. Do not register a separate MCP server per store."
+                "One shared SplatRAG MCP gateway. If you run more than one store, pass silo= on each tool call. Do not register a separate MCP server per store."
             } else {
                 "One SplatRAG MCP process. Pass silo= on a tool call to select a store other than this process's default."
             }

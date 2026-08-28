@@ -285,8 +285,7 @@ __global__ void integrate_kernel(
     const float *mass,
     float *pos,
     float *vel,
-    float *disp_out,
-    float *energy_out
+    float *stats_out
 ) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= p.n) {
@@ -308,8 +307,8 @@ __global__ void integrate_kernel(
     vel[i * 3 + 0] = v0;
     vel[i * 3 + 1] = v1;
     vel[i * 3 + 2] = v2;
-    atomicAdd(disp_out, fabsf(d0) + fabsf(d1) + fabsf(d2));
-    atomicAdd(energy_out, 0.5f * inertia * (v0 * v0 + v1 * v1 + v2 * v2));
+    atomicAdd(stats_out, fabsf(d0) + fabsf(d1) + fabsf(d2));
+    atomicAdd(stats_out + 1, 0.5f * inertia * (v0 * v0 + v1 * v1 + v2 * v2));
 }
 
 int blocks_for(int n) {
@@ -334,8 +333,8 @@ struct DreamCuda {
     int *idx_sorted = nullptr;
     void *cub_tmp = nullptr;
     size_t cub_bytes = 0;
-    float *disp = nullptr;
-    float *energy = nullptr;
+    // [total displacement, kinetic energy], copied to the host in one synchronized transfer.
+    float *stats = nullptr;
 };
 
 extern "C" int dream_cuda_probe(void) {
@@ -367,7 +366,9 @@ extern "C" DreamCuda *dream_cuda_create(
     if (!p || p->n <= 0) {
         return nullptr;
     }
-    if (dream_cuda_probe() != 0) {
+    // run_force_loop already performs the cached process-level probe. Select the first visible
+    // device here without repeating probe's cudaMalloc/cudaFree pair on every context creation.
+    if (cudaSetDevice(0) != cudaSuccess) {
         return nullptr;
     }
     auto *d = new DreamCuda();
@@ -389,8 +390,7 @@ extern "C" DreamCuda *dream_cuda_create(
     if (cudaMalloc(&d->keys_sorted, sizeof(uint64_t) * n) != cudaSuccess) return fail();
     if (cudaMalloc(&d->idx, sizeof(int) * n) != cudaSuccess) return fail();
     if (cudaMalloc(&d->idx_sorted, sizeof(int) * n) != cudaSuccess) return fail();
-    if (cudaMalloc(&d->disp, sizeof(float)) != cudaSuccess) return fail();
-    if (cudaMalloc(&d->energy, sizeof(float)) != cudaSuccess) return fail();
+    if (cudaMalloc(&d->stats, sizeof(float) * 2) != cudaSuccess) return fail();
 
     cub::DeviceRadixSort::SortPairs(
         nullptr,
@@ -431,8 +431,7 @@ extern "C" int dream_cuda_step(DreamCuda *d, float *out_disp, float *out_energy)
     }
     const int n = d->p.n;
     const int blocks = blocks_for(n);
-    CUDA_RETURN(cudaMemset(d->disp, 0, sizeof(float)));
-    CUDA_RETURN(cudaMemset(d->energy, 0, sizeof(float)));
+    CUDA_RETURN(cudaMemset(d->stats, 0, sizeof(float) * 2));
 
     if (d->p.neighbor_mode) {
         fill_keys_kernel<<<blocks, kThreads>>>(
@@ -482,13 +481,16 @@ extern "C" int dream_cuda_step(DreamCuda *d, float *out_disp, float *out_energy)
         d->mass,
         d->pos,
         d->vel,
-        d->disp,
-        d->energy
+        d->stats
     );
     CUDA_RETURN(cudaGetLastError());
-    CUDA_RETURN(cudaDeviceSynchronize());
-    CUDA_RETURN(cudaMemcpy(out_disp, d->disp, sizeof(float), cudaMemcpyDeviceToHost));
-    CUDA_RETURN(cudaMemcpy(out_energy, d->energy, sizeof(float), cudaMemcpyDeviceToHost));
+    // This blocking D2H transfer is the one required synchronization: the caller needs
+    // displacement to decide whether the field settled. A separate device sync plus two scalar
+    // copies made three host/driver round trips per dream step.
+    float stats[2] = {0.f, 0.f};
+    CUDA_RETURN(cudaMemcpy(stats, d->stats, sizeof(stats), cudaMemcpyDeviceToHost));
+    *out_disp = stats[0];
+    *out_energy = stats[1];
     return 0;
 }
 
@@ -519,7 +521,6 @@ extern "C" void dream_cuda_destroy(DreamCuda *d) {
     cudaFree(d->idx);
     cudaFree(d->idx_sorted);
     cudaFree(d->cub_tmp);
-    cudaFree(d->disp);
-    cudaFree(d->energy);
+    cudaFree(d->stats);
     delete d;
 }

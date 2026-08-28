@@ -20,9 +20,10 @@ pub fn discover_basins(
     previous: &[Basin],
     config: &PhysicsConfig,
     ann: Option<&KeyedAnn>,
+    semantic_neighbors: Option<&[Vec<usize>]>,
 ) -> (Vec<Basin>, Vec<PersistenceInterval>) {
     // Pack to 64d geometry. 3D radius percolation was gluing the PCA picture into one well.
-    let edges = hidden_knn_edges(splats, config, ann);
+    let edges = hidden_knn_edges(splats, config, ann, semantic_neighbors);
     let mut union = UnionFind::new(splats.len());
     let mut intervals = Vec::new();
     let min_size = config.min_basin_size.max(1);
@@ -190,7 +191,7 @@ pub fn discover_basins(
         }
     }
 
-    attach_crumbs(splats, &mut basins, config, ann);
+    attach_crumbs(splats, &mut basins, config, ann, semantic_neighbors);
 
     basins.sort_by(|a, b| a.id.cmp(&b.id));
     (basins, intervals)
@@ -202,6 +203,7 @@ fn attach_crumbs(
     basins: &mut [Basin],
     config: &PhysicsConfig,
     ann: Option<&KeyedAnn>,
+    semantic_neighbors: Option<&[Vec<usize>]>,
 ) {
     let attach = config.basin_attach_cosine;
     if attach <= 0.0 || basins.is_empty() {
@@ -231,9 +233,15 @@ fn attach_crumbs(
         if splats[index].muted || splats[index].basin_locked || splats[index].basin_id.is_some() {
             continue;
         }
-        if let Some(basin_id) =
-            best_basin_for(splats, index, attach, config, ann, &id_to_index, &assigned)
-        {
+        if let Some(basin_id) = best_basin_for(
+            splats,
+            index,
+            config,
+            ann,
+            semantic_neighbors,
+            &id_to_index,
+            &assigned,
+        ) {
             assign_to_basin(splats, basins, &basin_index, &mut grown, index, &basin_id);
         }
     }
@@ -245,16 +253,17 @@ fn attach_crumbs(
 
 /// Strongest well for crumb `index` over its candidate neighbors: the ANN graph when one
 /// was passed, else every already-assigned splat. Returns the basin id of the best cosine
-/// at or above `attach`, if any.
+/// at or above the configured attach threshold, if any.
 fn best_basin_for(
     splats: &[Splat],
     index: usize,
-    attach: f32,
     config: &PhysicsConfig,
     ann: Option<&KeyedAnn>,
+    semantic_neighbors: Option<&[Vec<usize>]>,
     id_to_index: &HashMap<Uuid, usize>,
     assigned: &[usize],
 ) -> Option<String> {
+    let attach = config.basin_attach_cosine;
     let mut best_cosine = f32::NEG_INFINITY;
     let mut best_basin: Option<String> = None;
 
@@ -272,11 +281,20 @@ fn best_basin_for(
         }
     };
 
-    if let Some(ann) = ann {
+    let requested = config.basin_knn.max(8).saturating_mul(4);
+    // The dream force table intentionally stores at most 32 neighbors. Fall back to
+    // ANN for wider basin configurations rather than silently truncating topology.
+    if requested <= crate::cuda_dream::MAX_SEM_NBR
+        && let Some(neighbors) = semantic_neighbors.and_then(|all| all.get(index))
+    {
+        for &other in neighbors.iter().take(requested) {
+            consider(other);
+        }
+    } else if let Some(ann) = ann {
         let neighbors = ann
             .neighbors_for_key(splats[index].memory_id)
             .unwrap_or_default();
-        for id in neighbors.into_iter().take(config.basin_knn.max(8) * 4) {
+        for id in neighbors.into_iter().take(requested) {
             if let Some(&other) = id_to_index.get(&id) {
                 consider(other);
             }
@@ -353,8 +371,47 @@ struct Edge {
     distance: f32,
 }
 
+struct EdgeCollector {
+    threshold: f32,
+    seen: HashSet<(usize, usize)>,
+    edges: Vec<Edge>,
+}
+
+impl EdgeCollector {
+    fn new(threshold: f32) -> Self {
+        Self {
+            threshold,
+            seen: HashSet::new(),
+            edges: Vec::new(),
+        }
+    }
+
+    fn add(&mut self, left: usize, right: usize, cosine_value: f32) {
+        if left == right || cosine_value < self.threshold {
+            return;
+        }
+        let (left, right) = if left < right {
+            (left, right)
+        } else {
+            (right, left)
+        };
+        if self.seen.insert((left, right)) {
+            self.edges.push(Edge {
+                left,
+                right,
+                distance: (1.0 - cosine_value).clamp(0.0, 2.0),
+            });
+        }
+    }
+}
+
 /// 64d k-NN edges. `distance` is `1 - cosine` so Kruskal packs tight wells first.
-fn hidden_knn_edges(splats: &[Splat], config: &PhysicsConfig, ann: Option<&KeyedAnn>) -> Vec<Edge> {
+fn hidden_knn_edges(
+    splats: &[Splat],
+    config: &PhysicsConfig,
+    ann: Option<&KeyedAnn>,
+    semantic_neighbors: Option<&[Vec<usize>]>,
+) -> Vec<Edge> {
     // 0.55 is the dream force-neutral, not a basin edge. On Qwen3 SciFact, random
     // paper–paper cosine p90 is ~0.55, so that gate percolates the whole science
     // manifold. Pack wells at `basin_core_cosine` (the tight 64d neighborhood).
@@ -373,68 +430,19 @@ fn hidden_knn_edges(splats: &[Splat], config: &PhysicsConfig, ann: Option<&Keyed
     } else {
         config.basin_knn.max(1).min(live.len() - 1)
     };
-    let mut seen = HashSet::new();
-    let mut edges = Vec::new();
-    let mut push = |left: usize, right: usize, cosine_value: f32| {
-        if left == right || cosine_value < threshold {
-            return;
-        }
-        let (left, right) = if left < right {
-            (left, right)
-        } else {
-            (right, left)
-        };
-        if !seen.insert((left, right)) {
-            return;
-        }
-        edges.push(Edge {
-            left,
-            right,
-            distance: (1.0 - cosine_value).clamp(0.0, 2.0),
-        });
-    };
+    let mut collector = EdgeCollector::new(threshold);
 
-    if let Some(ann) = ann {
-        let id_to_index: HashMap<Uuid, usize> = splats
-            .iter()
-            .enumerate()
-            .map(|(index, splat)| (splat.memory_id, index))
-            .collect();
-        for &index in &live {
-            let neighbors = ann
-                .neighbors_for_key(splats[index].memory_id)
-                .unwrap_or_default();
-            for id in neighbors.into_iter().take(k) {
-                let Some(&other) = id_to_index.get(&id) else {
-                    continue;
-                };
-                if splats[other].muted {
-                    continue;
-                }
-                let cosine_value = cosine(&splats[index].semantics, &splats[other].semantics);
-                push(index, other, cosine_value);
-            }
-        }
+    if k <= crate::cuda_dream::MAX_SEM_NBR
+        && let Some(neighbors_by_index) = semantic_neighbors
+    {
+        collect_precomputed_edges(splats, &live, neighbors_by_index, k, &mut collector);
+    } else if let Some(ann) = ann {
+        collect_ann_edges(splats, &live, ann, k, &mut collector);
     } else {
-        for (rank, &index) in live.iter().enumerate() {
-            let mut scored: Vec<(f32, usize)> = live
-                .iter()
-                .enumerate()
-                .filter(|(other_rank, _)| *other_rank != rank)
-                .map(|(_, &other)| {
-                    (
-                        cosine(&splats[index].semantics, &splats[other].semantics),
-                        other,
-                    )
-                })
-                .collect();
-            scored.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-            for (cosine_value, other) in scored.into_iter().take(k) {
-                push(index, other, cosine_value);
-            }
-        }
+        collect_brute_force_edges(splats, &live, k, &mut collector);
     }
 
+    let mut edges = collector.edges;
     edges.sort_by(|a, b| {
         a.distance
             .total_cmp(&b.distance)
@@ -442,6 +450,85 @@ fn hidden_knn_edges(splats: &[Splat], config: &PhysicsConfig, ann: Option<&Keyed
             .then_with(|| splats[a.right].memory_id.cmp(&splats[b.right].memory_id))
     });
     edges
+}
+
+fn collect_precomputed_edges(
+    splats: &[Splat],
+    live: &[usize],
+    neighbors_by_index: &[Vec<usize>],
+    k: usize,
+    collector: &mut EdgeCollector,
+) {
+    for &index in live {
+        let Some(neighbors) = neighbors_by_index.get(index) else {
+            continue;
+        };
+        for &other in neighbors.iter().take(k) {
+            if !splats[other].muted {
+                collector.add(
+                    index,
+                    other,
+                    cosine(&splats[index].semantics, &splats[other].semantics),
+                );
+            }
+        }
+    }
+}
+
+fn collect_ann_edges(
+    splats: &[Splat],
+    live: &[usize],
+    ann: &KeyedAnn,
+    k: usize,
+    collector: &mut EdgeCollector,
+) {
+    let id_to_index: HashMap<Uuid, usize> = splats
+        .iter()
+        .enumerate()
+        .map(|(index, splat)| (splat.memory_id, index))
+        .collect();
+    for &index in live {
+        let neighbors = ann
+            .neighbors_for_key(splats[index].memory_id)
+            .unwrap_or_default();
+        for id in neighbors.into_iter().take(k) {
+            let Some(&other) = id_to_index.get(&id) else {
+                continue;
+            };
+            if !splats[other].muted {
+                collector.add(
+                    index,
+                    other,
+                    cosine(&splats[index].semantics, &splats[other].semantics),
+                );
+            }
+        }
+    }
+}
+
+fn collect_brute_force_edges(
+    splats: &[Splat],
+    live: &[usize],
+    k: usize,
+    collector: &mut EdgeCollector,
+) {
+    for (rank, &index) in live.iter().enumerate() {
+        let mut scored: Vec<(f32, usize)> = live
+            .iter()
+            .enumerate()
+            .filter(|(other_rank, _)| *other_rank != rank)
+            .map(|(_, &other)| {
+                (
+                    cosine(&splats[index].semantics, &splats[other].semantics),
+                    other,
+                )
+            })
+            .collect();
+        scored.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        for (cosine_value, other) in scored.into_iter().take(k) {
+            collector.add(index, other, cosine_value);
+        }
+    }
 }
 
 fn split_overloaded(members: &[usize], splats: &[Splat], max_size: usize) -> Vec<Vec<usize>> {
@@ -595,7 +682,7 @@ mod tests {
             splat(5, [0.05, 0.0, 0.0], 1),
             splat(6, [0.1, 0.0, 0.0], 1),
         ];
-        let (basins, _) = discover_basins(&mut splats, &[], &config(), None);
+        let (basins, _) = discover_basins(&mut splats, &[], &config(), None, None);
         assert_eq!(
             basins.len(),
             2,
@@ -629,9 +716,36 @@ mod tests {
             splat(5, [50.1, 0.0, 0.0], 0),
             splat(6, [50.2, 0.0, 0.0], 0),
         ];
-        let (basins, _) = discover_basins(&mut splats, &[], &config(), None);
+        let (basins, _) = discover_basins(&mut splats, &[], &config(), None, None);
         assert_eq!(basins.len(), 1);
         assert_eq!(basins[0].member_ids.len(), 6);
+    }
+
+    #[test]
+    fn precomputed_neighbors_drive_basin_discovery_without_another_ann_walk() {
+        let mut splats = vec![
+            splat(1, [0.0; 3], 0),
+            splat(2, [0.0; 3], 0),
+            splat(3, [0.0; 3], 0),
+            splat(4, [0.0; 3], 1),
+            splat(5, [0.0; 3], 1),
+            splat(6, [0.0; 3], 1),
+        ];
+        let neighbors = vec![
+            vec![1, 2],
+            vec![0, 2],
+            vec![0, 1],
+            vec![4, 5],
+            vec![3, 5],
+            vec![3, 4],
+        ];
+        let (basins, _) = discover_basins(&mut splats, &[], &config(), None, Some(&neighbors));
+        let mut sizes = basins
+            .iter()
+            .map(|basin| basin.member_ids.len())
+            .collect::<Vec<_>>();
+        sizes.sort();
+        assert_eq!(sizes, vec![3, 3]);
     }
 
     #[test]
@@ -648,7 +762,7 @@ mod tests {
             splat(6, [0.0; 3], 1),
             bridge,
         ];
-        let (basins, _) = discover_basins(&mut splats, &[], &config(), None);
+        let (basins, _) = discover_basins(&mut splats, &[], &config(), None, None);
         assert_eq!(basins.len(), 2);
     }
 
@@ -666,7 +780,7 @@ mod tests {
             splat(6, [0.0; 3], 1),
             crumb,
         ];
-        let (basins, _) = discover_basins(&mut splats, &[], &config(), None);
+        let (basins, _) = discover_basins(&mut splats, &[], &config(), None, None);
         assert_eq!(basins.len(), 2);
         let sizes: Vec<usize> = {
             let mut s: Vec<usize> = basins.iter().map(|b| b.member_ids.len()).collect();

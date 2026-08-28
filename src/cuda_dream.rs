@@ -27,6 +27,7 @@ mod ffi {
     use anyhow::{Result, bail};
     use std::collections::HashMap;
     use std::os::raw::c_int;
+    use std::sync::OnceLock;
 
     #[repr(C)]
     struct DreamCudaParams {
@@ -76,7 +77,11 @@ mod ffi {
     }
 
     pub fn available() -> bool {
-        unsafe { dream_cuda_probe() == 0 }
+        // CUDA context creation and the probe allocation are process-level work. The legacy
+        // Niodoo GPU layer got this part right: cache the successful context capability instead of
+        // allocating/freeing a probe word before every dream.
+        static AVAILABLE: OnceLock<bool> = OnceLock::new();
+        *AVAILABLE.get_or_init(|| unsafe { dream_cuda_probe() == 0 })
     }
 
     struct PackedSoA {

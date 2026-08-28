@@ -1,10 +1,16 @@
 use crate::record::{MemoryRecord, RecallContext};
 use anyhow::{Context, Result};
+use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
+
+#[derive(Deserialize)]
+struct RecordId {
+    id: Uuid,
+}
 
 #[derive(Debug, Clone)]
 pub struct ColdStore {
@@ -45,11 +51,20 @@ impl ColdStore {
     }
 
     pub fn ids(&self) -> Result<HashSet<Uuid>> {
-        Ok(self
-            .load_all()?
-            .into_iter()
-            .map(|record| record.id)
-            .collect())
+        let file = File::open(&self.path)?;
+        let mut ids = HashSet::new();
+        for (index, line) in BufReader::new(file).lines().enumerate() {
+            let line = line.with_context(|| format!("failed reading cold line {}", index + 1))?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            // serde ignores the heavy text/metadata fields. append_new only needs identity, so do
+            // not materialize the complete cold store merely to reject duplicate UUIDs.
+            let row: RecordId = serde_json::from_str(&line)
+                .with_context(|| format!("invalid cold record on line {}", index + 1))?;
+            ids.insert(row.id);
+        }
+        Ok(ids)
     }
 
     pub fn append_new(&self, records: &[MemoryRecord]) -> Result<usize> {
@@ -130,11 +145,18 @@ impl ColdStore {
     }
 
     pub fn record_map(&self) -> Result<HashMap<Uuid, MemoryRecord>> {
-        Ok(self
-            .load_all()?
-            .into_iter()
-            .map(|record| (record.id, record))
-            .collect())
+        let file = File::open(&self.path)?;
+        let mut records = HashMap::new();
+        for (index, line) in BufReader::new(file).lines().enumerate() {
+            let line = line.with_context(|| format!("failed reading cold line {}", index + 1))?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let record: MemoryRecord = serde_json::from_str(&line)
+                .with_context(|| format!("invalid cold record on line {}", index + 1))?;
+            records.insert(record.id, record);
+        }
+        Ok(records)
     }
 
     pub fn context(&self, target: &MemoryRecord, radius: usize) -> Result<RecallContext> {

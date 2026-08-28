@@ -151,7 +151,7 @@ pub async fn serve(service: Arc<MemoryService>) -> anyhow::Result<()> {
         eprintln!("live frame log → {path}");
     }
     // Domain colors on first paint so the field is readable without a dream.
-    if let Err(err) = service.recolor_field() {
+    if let Err(err) = service.recolor_field().await {
         eprintln!("recolor_field: {err:#}");
     }
     let app = Router::new()
@@ -460,7 +460,7 @@ async fn start_dream(
 async fn recolor(
     State(service): State<Arc<MemoryService>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    service.recolor_field()?;
+    service.recolor_field().await?;
     Ok(Json(serde_json::json!({"ok": true})))
 }
 

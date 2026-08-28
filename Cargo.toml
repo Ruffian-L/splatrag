@@ -27,8 +27,15 @@ exclude = [
 [workspace]
 resolver = "2"
 
+[features]
+default = []
+# Build the CPU fallback even when nvcc happens to be installed. build.rs already honored the
+# generated CARGO_FEATURE_NO_CUDA variable, but Cargo had no feature declaration to generate it.
+no-cuda = []
+
 [dependencies]
 anyhow = "1.0.104"
+arc-swap = "1.9.1"
 async-stream = "0.3"
 axum = { version = "0.7.9", features = ["json"] }
 futures-core = "0.3"

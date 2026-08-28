@@ -14,11 +14,13 @@ use crate::qdrant::QdrantIndex;
 use crate::record::{MemoryRecord, RecallFilters, RecallHit};
 use crate::retrieval::RetrievalEngine;
 use anyhow::{Context, Result, bail};
+use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, RwLock};
 use tokio::sync::{Mutex, broadcast};
 use uuid::Uuid;
 
@@ -83,8 +85,12 @@ pub struct MemoryService {
     qdrant: QdrantIndex,
     lexical: LexicalIndex,
     ann: KeyedAnn,
-    records: RwLock<HashMap<Uuid, MemoryRecord>>,
-    hot: RwLock<HotState>,
+    // Read-mostly stores use lock-free immutable Arc snapshots. A recall keeps two cheap Arc
+    // clones across embedding/Qdrant awaits instead of cloning every record and all 64-d splats
+    // per request. The mutation lane serializes replacements; Arc::make_mut copies only when a
+    // reader still owns the previous generation.
+    records: ArcSwap<HashMap<Uuid, MemoryRecord>>,
+    hot: ArcSwap<HotState>,
     mutation: Mutex<()>,
     live_tx: broadcast::Sender<LiveFrame>,
     dreaming: AtomicBool,
@@ -274,8 +280,8 @@ impl MemoryService {
             qdrant,
             lexical,
             ann,
-            records: RwLock::new(records),
-            hot: RwLock::new(hot),
+            records: ArcSwap::from_pointee(records),
+            hot: ArcSwap::from_pointee(hot),
             mutation: Mutex::new(()),
             live_tx,
             dreaming: AtomicBool::new(false),
@@ -297,13 +303,14 @@ impl MemoryService {
     }
 
     pub fn current_live_frame(&self) -> LiveFrame {
-        let ke = self.hot_read().kinetic_energy;
-        self.snapshot_live_frame(0, ke, self.is_dreaming(), false)
+        let hot = self.hot_read();
+        live_frame_from(&hot, 0, hot.kinetic_energy, self.is_dreaming(), false)
     }
 
     /// Recolor the hot field by basin for static viewing (no physics).
     /// Personal stores are almost all one domain; basin hue is what makes clusters readable.
-    pub fn recolor_field(&self) -> Result<()> {
+    pub async fn recolor_field(&self) -> Result<()> {
+        let _guard = self.mutation.lock().await;
         let mut hot = self.hot_write();
         for splat in &mut hot.splats {
             splat.color_rgba = domain_state_color(&splat.domain, splat.basin_id.as_deref(), 0.0);
@@ -360,22 +367,28 @@ impl MemoryService {
         let _guard = self.mutation.lock().await;
         self.qdrant.validate().await?;
         self.qdrant.ensure_scope_index().await?;
-        let mut records = self.records_read().values().cloned().collect::<Vec<_>>();
-        records.sort_by_key(|record| record.id);
-        let requested = records.len();
+        let records = self.records_read();
+        let mut ids = records.keys().copied().collect::<Vec<_>>();
+        ids.sort();
+        let requested = ids.len();
         let batch_size = self.embedding.batch_size();
-        for batch in records.chunks(batch_size) {
+        for id_batch in ids.chunks(batch_size) {
+            // Keep clone amplification bounded to one embed batch, not the whole cold store.
+            let batch = id_batch
+                .iter()
+                .filter_map(|id| records.get(id).cloned())
+                .collect::<Vec<_>>();
             let texts = batch
                 .iter()
-                .map(|record| record.text.clone())
+                .map(|record| record.text.as_str())
                 .collect::<Vec<_>>();
-            let embeddings = self.embedding.embed_batch(&texts).await?;
-            self.qdrant.upsert(batch, &embeddings).await?;
+            let embeddings = self.embedding.embed_slices(&texts).await?;
+            self.qdrant.upsert(&batch, &embeddings).await?;
             for (record, embedding) in batch.iter().zip(&embeddings) {
                 self.ann.set(record.id, &matryoshka64(embedding)?)?;
             }
-            self.lexical.add_records(batch)?;
-            self.hot_write().add_embeddings(batch, &embeddings)?;
+            self.lexical.add_records(&batch)?;
+            self.hot_write().add_embeddings(&batch, &embeddings)?;
             eprintln!("reindexed {}/{} memories", self.ann.len(), requested);
         }
         self.persist_hot_and_ann()?;
@@ -411,11 +424,11 @@ impl MemoryService {
         }
         let texts = new_records
             .iter()
-            .map(|record| record.text.clone())
+            .map(|record| record.text.as_str())
             .collect::<Vec<_>>();
         let mut embeddings = Vec::with_capacity(texts.len());
         for batch in texts.chunks(self.embedding.batch_size()) {
-            embeddings.extend(self.embedding.embed_batch(batch).await?);
+            embeddings.extend(self.embedding.embed_slices(batch).await?);
         }
 
         let appended = self.cold.append_new(&new_records)?;
@@ -456,7 +469,8 @@ impl MemoryService {
     ///
     /// Sidecar `splatrag ingest` and a long-lived MCP used to diverge: Tantivy
     /// could rank a new id, then `records.get` dropped it. Call this before recall.
-    pub fn refresh_from_cold(&self) -> Result<usize> {
+    pub async fn refresh_from_cold(&self) -> Result<usize> {
+        let _guard = self.mutation.lock().await;
         let offset = self.cold_len.load(Ordering::Relaxed);
         let (new_offset, new_records, rewritten) = self.cold.read_new_since(offset)?;
         let mut added = 0;
@@ -519,7 +533,7 @@ impl MemoryService {
         limit: usize,
         filters: &RecallFilters,
     ) -> Result<Vec<RecallHit>> {
-        self.refresh_from_cold()?;
+        self.refresh_from_cold().await?;
         let records = self.records_read().clone();
         let hot = self.hot_read().clone();
         RetrievalEngine {
@@ -547,7 +561,7 @@ impl MemoryService {
     ) -> Result<RetrievalArms> {
         let candidate_limit = candidate_limit.clamp(1, 500);
         let hybrid_limit = hybrid_limit.clamp(1, 100);
-        self.refresh_from_cold()?;
+        self.refresh_from_cold().await?;
         let records = self.records_read().clone();
         let hot = self.hot_read().clone();
 
@@ -644,7 +658,7 @@ impl MemoryService {
         filters: &RecallFilters,
     ) -> Result<RetrievalPool> {
         let candidate_limit = candidate_limit.clamp(1, 500);
-        self.refresh_from_cold()?;
+        self.refresh_from_cold().await?;
         let records = self.records_read();
         let lexical = self.lexical.search(query, candidate_limit)?;
         let full_query = self.embedding.embed(query).await?;
@@ -686,7 +700,7 @@ impl MemoryService {
     }
 
     pub fn records_snapshot(&self) -> HashMap<Uuid, MemoryRecord> {
-        self.records_read().clone()
+        self.records_read().as_ref().clone()
     }
 
     /// Pick memories for a live steering host, with the knobs to apply them.
@@ -750,7 +764,7 @@ impl MemoryService {
         self.collapse_duplicates_if_enabled()?;
         // Clone the field, then drop the hot write lock so status/splats keep
         // serving the last committed picture while the force loop runs.
-        let mut work = self.hot_read().clone();
+        let mut work = self.hot_read().as_ref().clone();
         let report = dream(&mut work, &self.ann, &self.config.physics)?;
         {
             let mut hot = self.hot_write();
@@ -951,13 +965,13 @@ impl MemoryService {
             .iter()
             .map(|splat| splat.memory_id)
             .collect();
-        let mut missing = self
-            .records_read()
+        let records = self.records_read();
+        let mut missing = records
             .values()
             .filter(|record| !ann_keys.contains(&record.id) || !hot_keys.contains(&record.id))
-            .cloned()
+            .map(|record| record.id)
             .collect::<Vec<_>>();
-        missing.sort_by_key(|record| record.id);
+        missing.sort();
         let missing_count = missing.len();
         if missing.is_empty() {
             return Ok(BackfillReport {
@@ -972,7 +986,11 @@ impl MemoryService {
         self.qdrant.ensure_scope_index().await?;
         let mut embedded = 0;
         let batch_size = self.embedding.batch_size();
-        for batch in missing.chunks(batch_size) {
+        for id_batch in missing.chunks(batch_size) {
+            let batch = id_batch
+                .iter()
+                .filter_map(|id| records.get(id).cloned())
+                .collect::<Vec<_>>();
             let texts = batch
                 .iter()
                 .map(|record| {
@@ -984,12 +1002,12 @@ impl MemoryService {
                 })
                 .collect::<Vec<_>>();
             let embeddings = self.embedding.embed_batch(&texts).await?;
-            self.qdrant.upsert(batch, &embeddings).await?;
+            self.qdrant.upsert(&batch, &embeddings).await?;
             for (record, embedding) in batch.iter().zip(&embeddings) {
                 self.ann.set(record.id, &matryoshka64(embedding)?)?;
             }
-            self.lexical.add_records(batch)?;
-            self.hot_write().add_embeddings(batch, &embeddings)?;
+            self.lexical.add_records(&batch)?;
+            self.hot_write().add_embeddings(&batch, &embeddings)?;
             embedded += batch.len();
             eprintln!("backfill-derived {}/{} missing", embedded, missing_count);
         }
@@ -1098,7 +1116,7 @@ impl MemoryService {
     }
 
     pub fn hot_snapshot(&self) -> HotState {
-        self.hot_read().clone()
+        self.hot_read().as_ref().clone()
     }
 
     pub fn record(&self, id: Uuid) -> Option<MemoryRecord> {
@@ -1412,26 +1430,58 @@ impl MemoryService {
         result
     }
 
-    fn records_read(&self) -> RwLockReadGuard<'_, HashMap<Uuid, MemoryRecord>> {
-        self.records
-            .read()
-            .unwrap_or_else(|poison| poison.into_inner())
+    fn records_read(&self) -> Arc<HashMap<Uuid, MemoryRecord>> {
+        self.records.load_full()
     }
 
-    fn records_write(&self) -> RwLockWriteGuard<'_, HashMap<Uuid, MemoryRecord>> {
-        self.records
-            .write()
-            .unwrap_or_else(|poison| poison.into_inner())
+    fn records_write(&self) -> SnapshotWriteGuard<'_, HashMap<Uuid, MemoryRecord>> {
+        SnapshotWriteGuard::new(&self.records)
     }
 
-    fn hot_read(&self) -> RwLockReadGuard<'_, HotState> {
-        self.hot.read().unwrap_or_else(|poison| poison.into_inner())
+    fn hot_read(&self) -> Arc<HotState> {
+        self.hot.load_full()
     }
 
-    fn hot_write(&self) -> RwLockWriteGuard<'_, HotState> {
-        self.hot
-            .write()
-            .unwrap_or_else(|poison| poison.into_inner())
+    fn hot_write(&self) -> SnapshotWriteGuard<'_, HotState> {
+        SnapshotWriteGuard::new(&self.hot)
+    }
+}
+
+/// Mutable access to the current snapshot inside the service's serialized mutation lane.
+/// With no concurrent reader this mutates in place; otherwise Arc's copy-on-write preserves the
+/// generation an in-flight request is using. Dropping the guard atomically publishes the result.
+struct SnapshotWriteGuard<'a, T: Clone> {
+    cell: &'a ArcSwap<T>,
+    value: Option<Arc<T>>,
+}
+
+impl<'a, T: Clone> SnapshotWriteGuard<'a, T> {
+    fn new(cell: &'a ArcSwap<T>) -> Self {
+        Self {
+            cell,
+            value: Some(cell.load_full()),
+        }
+    }
+}
+
+impl<T: Clone> Deref for SnapshotWriteGuard<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        self.value.as_deref().expect("snapshot guard value")
+    }
+}
+
+impl<T: Clone> DerefMut for SnapshotWriteGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        Arc::make_mut(self.value.as_mut().expect("snapshot guard value"))
+    }
+}
+
+impl<T: Clone> Drop for SnapshotWriteGuard<'_, T> {
+    fn drop(&mut self) {
+        self.cell
+            .store(self.value.take().expect("snapshot guard value"));
     }
 }
 
@@ -1443,13 +1493,15 @@ fn live_frame_from(
     done: bool,
 ) -> LiveFrame {
     // Same filter as GET /api/splats?level=memories so Basin Field can zip by boot id list.
-    let visible: Vec<_> = hot.splats.iter().filter(|splat| !splat.muted).collect();
-    let n = visible.len();
-    let mut positions = Vec::with_capacity(n * 3);
-    let mut colors = Vec::with_capacity(n * 4);
-    for splat in &visible {
+    // Do not allocate an intermediate Vec<&Splat> for every live frame. At personal-store scale
+    // that was another ~1 MiB allocation each emission before positions/colors were even packed.
+    let mut positions = Vec::with_capacity(hot.splats.len() * 3);
+    let mut colors = Vec::with_capacity(hot.splats.len() * 4);
+    let mut n = 0usize;
+    for splat in hot.splats.iter().filter(|splat| !splat.muted) {
         positions.extend_from_slice(&splat.position);
         colors.extend_from_slice(&splat.color_rgba);
+        n += 1;
     }
     LiveFrame {
         step,
@@ -2202,7 +2254,21 @@ mod cold_refresh_tests {
     use crate::config::AppConfig;
 
     #[test]
-    fn refresh_from_cold_loads_sidecar_append() {
+    fn snapshot_writer_copies_only_when_an_old_generation_is_live() {
+        let cell = ArcSwap::from_pointee(vec![1usize]);
+        let old = cell.load_full();
+        {
+            let mut current = SnapshotWriteGuard::new(&cell);
+            current.push(2);
+        }
+        let current = cell.load_full();
+        assert_eq!(old.as_slice(), &[1]);
+        assert_eq!(current.as_slice(), &[1, 2]);
+        assert!(!Arc::ptr_eq(&old, &current));
+    }
+
+    #[tokio::test]
+    async fn refresh_from_cold_loads_sidecar_append() {
         let temp = tempfile::tempdir().unwrap();
         let mut config = AppConfig::default();
         config.data_dir = temp.path().to_path_buf();
@@ -2215,7 +2281,7 @@ mod cold_refresh_tests {
             service.record(record.id).is_none(),
             "sidecar append is not in the MCP RAM map yet"
         );
-        let added = service.refresh_from_cold().unwrap();
+        let added = service.refresh_from_cold().await.unwrap();
         assert_eq!(added, 1);
         let loaded = service
             .record(record.id)

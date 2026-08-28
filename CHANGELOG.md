@@ -2,6 +2,14 @@
 
 User-facing changes to the SplatRAG engine. Lab notes stay local.
 
+## 2026-08-28 — CUDA and memory-path performance audit
+
+We did: removed whole-store per-query clones and other transient allocation spikes, moved read-mostly state to lock-free `ArcSwap` snapshots, reused ANN neighborhoods, streamed cold/hot loads, and reduced CUDA step synchronization. Audited the legacy Niodoo GPU tree and retained only its safe context-reuse idea. Verified 153 tests, CPU-only compilation, and both CUDA force modes on the GB10. Two read-only live-store startups took 5.77–7.37 s at about 1.303 GiB peak RSS while the store was actively growing. Did not hydrate indexes, dream the real store, merge data, train, or run a model eval. Research: `research/logs/2026-08-28_cuda-and-memory-path-performance-audit.md`.
+
+We think: lock-free immutable `ArcSwap` snapshots and bounded batch allocations remove concurrency-shaped RSS growth and read-lock contention; sparse HNSW topology remains safer than porting legacy quadratic Rips/LoPHAT GPU code.
+
+Next: profile concurrent recall on the live corpus after its newly observed HNSW drift (latest `cold=120859`, `hnsw=807`) is repaired in a separate, explicit data operation.
+
 ## 3.0.0 — 2026-08-28
 
 Engine files that the 3.0.0 README already named are now in git: `claim.sh`, `run`, CUDA dream, remaining `src/`, template configs, poison corpus. Machine systemd units stay local. Still no GitHub public flip.

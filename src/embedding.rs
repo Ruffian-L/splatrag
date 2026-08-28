@@ -3,6 +3,7 @@ use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::borrow::Cow;
 use std::time::Duration;
 
 #[derive(Clone)]
@@ -20,7 +21,7 @@ pub struct LabelingClient {
 #[derive(Debug, Serialize)]
 struct EmbeddingRequest<'a> {
     model: &'a str,
-    input: &'a [String],
+    input: &'a [Cow<'a, str>],
     encoding_format: &'static str,
 }
 
@@ -44,7 +45,7 @@ impl EmbeddingClient {
     }
 
     pub async fn embed(&self, text: &str) -> Result<Vec<f32>> {
-        let mut vectors = self.embed_batch(&[text.to_string()]).await?;
+        let mut vectors = self.embed_slices(&[text]).await?;
         vectors.pop().context("embedding server returned no vector")
     }
 
@@ -54,10 +55,18 @@ impl EmbeddingClient {
     /// inputs, so 32 long memories in one call blow past the context even when each one fits alone.
     /// That is what still 400'd after the per-text cap, stopping Gemini at 4,992 of 15,113.
     pub async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        self.embed_slices(&refs).await
+    }
+
+    /// Borrow ordinary inputs all the way into serde. Only oversized texts allocate a clipped
+    /// copy, which avoids duplicating every record body during large ingest and reindex batches.
+    pub async fn embed_slices(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
-        let bounded: Vec<String> = texts.iter().map(|text| bound_for_embedding(text)).collect();
+        let bounded: Vec<Cow<'_, str>> =
+            texts.iter().map(|text| bound_for_embedding(text)).collect();
 
         let mut out = Vec::with_capacity(bounded.len());
         let mut start = 0usize;
@@ -79,7 +88,7 @@ impl EmbeddingClient {
         Ok(out)
     }
 
-    async fn embed_request(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+    async fn embed_request<'a>(&self, texts: &'a [Cow<'a, str>]) -> Result<Vec<Vec<f32>>> {
         let url = format!("{}/v1/embeddings", self.config.url.trim_end_matches('/'));
         let response = self
             .client
@@ -344,11 +353,11 @@ const EMBED_CHAR_BUDGET: usize = 24_000;
 const REQUEST_CHAR_BUDGET: usize = 48_000;
 
 /// Clip to [`EMBED_CHAR_BUDGET`] on a char boundary. Cheap no-op for the overwhelming majority.
-fn bound_for_embedding(text: &str) -> String {
+fn bound_for_embedding(text: &str) -> Cow<'_, str> {
     if text.len() <= EMBED_CHAR_BUDGET {
-        return text.to_string();
+        return Cow::Borrowed(text);
     }
-    text.chars().take(EMBED_CHAR_BUDGET).collect()
+    Cow::Owned(text.chars().take(EMBED_CHAR_BUDGET).collect())
 }
 
 pub fn normalize(vector: &mut [f32]) {
@@ -381,12 +390,15 @@ mod tests {
     #[test]
     fn oversized_text_is_bounded_but_ordinary_text_is_untouched() {
         let ordinary = "a normal conversational turn about splat memory";
-        assert_eq!(bound_for_embedding(ordinary), ordinary);
+        let bounded = bound_for_embedding(ordinary);
+        assert_eq!(bounded, ordinary);
+        assert!(matches!(bounded, Cow::Borrowed(_)));
 
         // Larger than the real 43,771-token record that aborted the Grok import.
         let huge = "x".repeat(EMBED_CHAR_BUDGET * 3);
         let bounded = bound_for_embedding(&huge);
         assert_eq!(bounded.chars().count(), EMBED_CHAR_BUDGET);
+        assert!(matches!(bounded, Cow::Owned(_)));
 
         // Multi-byte input must clip on a char boundary, not mid-codepoint.
         let wide = "日".repeat(EMBED_CHAR_BUDGET + 500);
