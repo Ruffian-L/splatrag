@@ -16,6 +16,13 @@ mkdir -p "$CONF_DIR" "$LOG_DIR"
 
 # Defaults; install.sh writes v3.env to override.
 _SP_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+if [[ -f "$CONF" ]]; then
+  # shellcheck disable=SC1090
+  set -a; . "$CONF"; set +a
+fi
+
+# Re-assign from env (v3.env may have set SPLATRAG_* above).
 ENGINE="${SPLATRAG_ENGINE:-$_SP_ROOT}"
 CONFIG="${SPLATRAG_CONFIG:-$ENGINE/splatrag.toml}"
 BIN="${SPLATRAG_BIN:-$ENGINE/target/release/splatrag}"
@@ -25,11 +32,6 @@ EMBED_PORT="${SPLATRAG_EMBED_PORT:-8081}"
 VIEWER_PORT="${SPLATRAG_VIEWER_PORT:-8767}"
 UNIT_SERVE="${SPLATRAG_UNIT_SERVE:-splatrag-serve.service}"
 UNIT_WATCH="${SPLATRAG_UNIT_WATCH:-}"
-
-if [[ -f "$CONF" ]]; then
-  # shellcheck disable=SC1090
-  set -a; . "$CONF"; set +a
-fi
 
 say()  { printf '%s\n' "$*"; }
 ok()   { printf '  on   %s\n' "$*"; }

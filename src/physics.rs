@@ -81,6 +81,21 @@ where
     // Duplicate collapse (see `crate::dedupe`) marks byte-identical copies muted. They
     // stay in cold and in the ANN index but are out of the physics entirely.
     let state_muted: Vec<bool> = state.splats.iter().map(|s| s.muted).collect();
+    let active_count = state_muted.iter().filter(|muted| !**muted).count();
+    let indexed_active = state
+        .splats
+        .iter()
+        .filter(|splat| !splat.muted && ann.contains_key(splat.memory_id))
+        .count();
+    // At personal-store scale the ANN graph is both the force neighborhood and the basin
+    // topology. Continuing with a partial graph does not merely reduce quality: every missing
+    // row looks isolated and gets its basin_id cleared. Fail before mutating geometry instead.
+    if active_count > NEIGHBOR_FORCE_AT && indexed_active * 100 < active_count * 95 {
+        anyhow::bail!(
+            "dream refused incomplete ANN topology: indexed {indexed_active}/{active_count} active splats ({:.1}%); run hydrate-ann before dreaming",
+            indexed_active as f64 * 100.0 / active_count.max(1) as f64
+        );
+    }
     let semantic_neighbors: Vec<Vec<usize>> = state
         .splats
         .par_iter()

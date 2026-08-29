@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use rayon::prelude::*;
+use splatrag::ann::KeyedAnn;
 use splatrag::diagnose::basin_component_curve;
 use splatrag::eval::{
     MAX_RECALL_DROP, classify_scifact_misses, evaluate_scifact, evaluate_scifact_roles,
@@ -8,7 +10,9 @@ use splatrag::eval::{
 use splatrag::geometry::HotState;
 use splatrag::ingest::{IngestReport, Ingestor, SourceKind};
 use splatrag::record::{MemoryRecord, RecallFilters};
+use splatrag::topology::discover_basins;
 use splatrag::{AppConfig, MemoryService};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -271,6 +275,11 @@ enum Command {
     /// Threshold → largest connected component in 64-d and in the 3-d picture.
     /// Does not change clustering.
     DiagnoseBasin {
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Preview current basin discovery on hot state without mutating or saving it.
+    DiagnoseTopology {
         #[arg(long)]
         out: Option<PathBuf>,
     },
@@ -713,6 +722,92 @@ async fn main() -> Result<()> {
                 std::fs::write(&path, &text)
                     .with_context(|| format!("write {}", path.display()))?;
                 eprintln!("basin curve → {}", path.display());
+            }
+            println!("{text}");
+        }
+        Command::DiagnoseTopology { out } => {
+            let mut hot = HotState::load(&config.hot_state_path())?;
+            let ann = KeyedAnn::open(config.ann_graph_path(), 64, &config.retrieval)?;
+            let active = hot.splats.iter().filter(|splat| !splat.muted).count();
+            let indexed_active = hot
+                .splats
+                .iter()
+                .filter(|splat| !splat.muted && ann.contains_key(splat.memory_id))
+                .count();
+            let assigned_before = hot
+                .splats
+                .iter()
+                .filter(|splat| !splat.muted && splat.basin_id.is_some())
+                .count();
+            let index_by_id: HashMap<_, _> = hot
+                .splats
+                .iter()
+                .enumerate()
+                .map(|(index, splat)| (splat.memory_id, index))
+                .collect();
+            let muted = hot
+                .splats
+                .iter()
+                .map(|splat| splat.muted)
+                .collect::<Vec<_>>();
+            let semantic_neighbors = hot
+                .splats
+                .par_iter()
+                .map(|splat| {
+                    ann.neighbors_for_key(splat.memory_id)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|id| index_by_id.get(&id).copied())
+                        .filter(|&index| !muted[index])
+                        .take(32)
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let previous = hot.basins.clone();
+            let (basins, intervals) = discover_basins(
+                &mut hot.splats,
+                &previous,
+                &config.physics,
+                Some(&ann),
+                Some(&semantic_neighbors),
+            );
+            let assigned = hot
+                .splats
+                .iter()
+                .filter(|splat| !splat.muted && splat.basin_id.is_some())
+                .count();
+            let mut sizes = basins
+                .iter()
+                .map(|basin| basin.member_ids.len())
+                .collect::<Vec<_>>();
+            sizes.sort_unstable();
+            let percentile = |numerator: usize, denominator: usize| {
+                if sizes.is_empty() {
+                    0
+                } else {
+                    sizes[(sizes.len() - 1) * numerator / denominator]
+                }
+            };
+            let report = serde_json::json!({
+                "active_splats": active,
+                "ann_keys": ann.len(),
+                "ann_coverage": indexed_active as f64 / active.max(1) as f64,
+                "previous_basins": previous.len(),
+                "assigned_before": assigned_before,
+                "basins": basins.len(),
+                "assigned": assigned,
+                "unassigned": active.saturating_sub(assigned),
+                "assignment_rate": assigned as f64 / active.max(1) as f64,
+                "largest_basin": sizes.last().copied().unwrap_or(0),
+                "p50_basin_size": percentile(1, 2),
+                "p90_basin_size": percentile(9, 10),
+                "merge_intervals": intervals.len(),
+            });
+            let text = serde_json::to_string_pretty(&report)?;
+            if let Some(path) = out {
+                std::fs::write(&path, &text)
+                    .with_context(|| format!("write {}", path.display()))?;
+                eprintln!("topology preview → {}", path.display());
             }
             println!("{text}");
         }

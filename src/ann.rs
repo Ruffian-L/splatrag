@@ -141,6 +141,15 @@ impl KeyedAnn {
         self.index_read().is_empty()
     }
 
+    /// Whether this exact memory id has a vector in the derived ANN graph.
+    ///
+    /// Dream/topology callers use this to distinguish an actually isolated splat from
+    /// a splat whose derived index entry is missing. Treating both as an empty
+    /// neighborhood used to silently turn index drift into mass basin unassignment.
+    pub fn contains_key(&self, id: Uuid) -> bool {
+        self.keys_read().contains_key(&id)
+    }
+
     pub fn keys(&self) -> Vec<Uuid> {
         let mut keys = self.keys_read().keys().copied().collect::<Vec<_>>();
         keys.sort();

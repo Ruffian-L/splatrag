@@ -165,21 +165,21 @@ pub struct PhysicsConfig {
     pub cross_domain_repulsion: f32,
     pub basin_radius: f32,
     pub min_basin_size: usize,
-    /// After discovery, components larger than this are axis-split into bags (not semantic cuts).
-    /// Hardcoded 5000 historically; exposed so personal-store scale can be measured without forks.
-    /// Set `0` to disable the bag split and keep pure geometry components.
+    /// After discovery, components larger than this are recursively bisected in 64-d semantic
+    /// geometry. Hardcoded 5000 historically; exposed for personal-store scale.
+    /// Set `0` to disable the size cap.
     #[serde(default = "default_basin_max_members")]
     pub basin_max_members: usize,
     /// How many 64d neighbors seed basin edges. 0 = all pairs above `semantic_threshold`.
     /// Discovery packs to hidden-state geometry, not 3D cell percolation.
     #[serde(default = "default_basin_knn")]
     pub basin_knn: usize,
-    /// Two basins that already have `min_basin_size` members merge only if cosine
-    /// is at least this. Stops a weak k-NN bridge from gluing two wells into soup.
+    /// Mutual k-NN core edges must meet this cosine. Component centroids must also remain
+    /// coherent while edges merge, so a locally strong bridge cannot chain two modes together.
     #[serde(default = "default_basin_core_cosine")]
     pub basin_core_cosine: f32,
-    /// Crumbs join the nearest existing well at this cosine. Never merges two wells.
-    /// Gaussian falloff onto a mode; 0 disables attach.
+    /// Border splats propagate onto the nearest existing well at this cosine. Assignment is
+    /// staged across a few hops and never merges two wells. Set 0 to disable attachment.
     #[serde(default = "default_basin_attach_cosine")]
     pub basin_attach_cosine: f32,
     pub spatial_cell_size: f32,
@@ -264,7 +264,7 @@ impl Default for QdrantConfig {
             url: "http://127.0.0.1:6360".into(),
             collection: "export-conversations".into(),
             api_key: None,
-            enabled: true,
+            enabled: false,
         }
     }
 }
