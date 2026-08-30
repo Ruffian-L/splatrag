@@ -2,6 +2,23 @@
 
 User-facing changes to the SplatRAG engine. Lab notes stay local.
 
+## 2026-08-30 — Clear saturated embed queue and restore MCP recall
+
+We did: restarted `splatrag-embed.service` and `splatrag-personal-serve.service`
+after `ensure_ready` hung for more than a minute behind multi-thousand-token
+embedding jobs. Verified embed health (`HTTP 200`), personal store status
+(`124,753` cold records, `124,066` HNSW keys/splats, `1,723` basins), and a real
+MCP `recall` completing in 8.8 seconds. Did not change code, indexes, memories,
+dream state, or model configuration.
+
+We think: the services were alive but their shared embed queue was saturated;
+clearing that queue restored the gateway without a data repair.
+
+Next: identify which caller submits multi-thousand-token embedding requests and
+bound or chunk those requests before they can monopolize all four embed slots.
+
+Research: `research_logs/2026-08-30_clear-saturated-embed-queue.md`
+
 ## 2026-08-29 — Controlled A/B: basin cap + mutual-kNN topology
 
 We did: froze a snapshot of the live personal store (`/tmp/splatrag-snapshot-aug29-1150`), built `diagnose_topology` in both the baseline (`adb93b0`) and modified topology, and ran both on identical bytes (87,165 active splats, 129,976-key ANN graph). Deterministic across re-runs.
