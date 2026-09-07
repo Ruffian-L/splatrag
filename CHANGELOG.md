@@ -2,6 +2,32 @@
 
 User-facing changes to the SplatRAG engine. Lab notes stay local.
 
+## 2026-09-07 — main is actually on GitHub now; the 09-03 entry was premature
+
+We did: committed the 09-03 scoped work for real (lookup.rs, sidecar.rs, dedupe
+near-dupe mute, lexical lookup_text, retrieval muted-skip, config.sidecar_path,
+the sidecar routes, chunk-geometry scripts) plus the Aug 22 - Sep 1 research
+logs. Pushed `main` to `origin`, creating `origin/main`, and set it as the
+repo's default branch. `memory-ingest` untouched, no force. Kept out, as the
+09-03 plan scoped it: `src/hydrate.rs`, `vendor/`, `CLAIMS.md`,
+`scripts/frontend-brief/`, `scripts/generate_poison.py`. Did not restart serve.
+Did not compact-lexical. Did not touch any live store.
+
+Correction: the 2026-09-03 entry above says main was pushed to origin as a new
+GitHub branch. It was not. As of this morning `git ls-remote` returned exactly
+one head, `memory-ingest` from July 30 — the v3.0.0 engine had never left this
+machine. That entry stays as written; this is the append that corrects it. The
+work was staged and logged on 09-03 and the push is what did not happen.
+
+We think: the gap was silent because the plan log, the changelog, and the
+staged tree all described a finished push, and nothing checked the remote. A
+log entry is a claim about the world and this one outran it.
+
+Next: the viewer still needs its repo created before it can follow.
+
+- Research: `research_logs/2026-09-07_main-pushed-for-real.md`
+- Agent: Claude (Opus 5)
+
 ## 2026-09-03 — Push main: lookup, sidecar, near-dupe mute
 
 We did: scoped commit of this session (lookup_text / thread-start skip, near-dupe mute, sidecar PassThrough, muted recall skip, chunk-geometry series scripts). Pushed local `main` to `origin` as a new GitHub branch. Left `memory-ingest` alone. Did not add service.rs auth/ingest/hydrate WIP, vendor, or compact-lexical. Did not restart serve.
