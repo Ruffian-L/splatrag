@@ -239,6 +239,9 @@ impl RetrievalEngine<'_> {
                 continue;
             }
             let splat = splats.get(&id);
+            if splat.is_some_and(|s| s.muted) {
+                continue;
+            }
             let basin_id = splat.and_then(|splat| splat.basin_id.clone());
             if let Some(required) = &filters.basin_id
                 && basin_id.as_ref() != Some(required)

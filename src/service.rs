@@ -3,6 +3,7 @@ use crate::cold_store::ColdStore;
 use crate::config::AppConfig;
 use crate::embedding::{EmbeddingClient, LabelingClient, matryoshka64};
 use crate::geometry::{Basin, HotState};
+use crate::sidecar::{EpistemicPolicy, SidecarState, SidecarStore};
 use crate::inversion::{self, InversionOp, collapse_risk};
 use crate::lexical::LexicalIndex;
 use crate::packet::{
@@ -20,7 +21,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use tokio::sync::{Mutex, broadcast};
 use uuid::Uuid;
 
@@ -98,6 +99,8 @@ pub struct MemoryService {
     live_log: RwLock<Option<PathBuf>>,
     /// Byte offset in `cold/memories.jsonl` already loaded into `records`.
     cold_len: AtomicU64,
+    /// Belief about a splat. Never mixed into embed text.
+    sidecar: StdMutex<SidecarStore>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -271,6 +274,7 @@ impl MemoryService {
         let lexical = LexicalIndex::open(config.lexical_path())?;
         let ann = KeyedAnn::open(config.ann_graph_path(), 64, &config.retrieval)?;
         let hot = HotState::load(&config.hot_state_path())?;
+        let sidecar = SidecarStore::open(config.sidecar_path())?;
         let (live_tx, _) = broadcast::channel(16);
         Ok(Self {
             config,
@@ -287,7 +291,20 @@ impl MemoryService {
             dreaming: AtomicBool::new(false),
             live_log: RwLock::new(None),
             cold_len: AtomicU64::new(cold_len),
+            sidecar: StdMutex::new(sidecar),
         })
+    }
+
+    pub fn sidecar_get(&self, id: Uuid) -> SidecarState {
+        self.sidecar.lock().expect("sidecar lock").get(id)
+    }
+
+    pub fn sidecar_put(&self, id: Uuid, state: SidecarState) -> Result<()> {
+        self.sidecar.lock().expect("sidecar lock").put(id, state)
+    }
+
+    pub fn sidecar_set_policy(&self, policy: EpistemicPolicy) {
+        self.sidecar.lock().expect("sidecar lock").policy = policy;
     }
 
     pub fn set_live_log_path(&self, path: Option<PathBuf>) {
@@ -536,7 +553,7 @@ impl MemoryService {
         self.refresh_from_cold().await?;
         let records = self.records_read().clone();
         let hot = self.hot_read().clone();
-        RetrievalEngine {
+        let hits = RetrievalEngine {
             embedding: &self.embedding,
             qdrant: &self.qdrant,
             ann: &self.ann,
@@ -544,7 +561,9 @@ impl MemoryService {
             config: &self.config.retrieval,
         }
         .recall(query, limit, filters, &records, &hot)
-        .await
+        .await?;
+        let sidecar = self.sidecar.lock().expect("sidecar lock");
+        Ok(sidecar.filter_hits(hits, chrono::Utc::now()))
     }
 
     /// Separate retrieval arms for miss classification (BM25 vs dense vs hybrid rank).
@@ -789,9 +808,10 @@ impl MemoryService {
         };
         if report.muted > 0 || report.already_muted > 0 {
             eprintln!(
-                "dream: duplicate collapse — {} groups, {} muted this pass ({} already), \
-                 largest group {}, {} active splats",
+                "dream: duplicate collapse — {} groups ({} near), {} muted this pass \
+                 ({} already), largest group {}, {} active splats",
                 report.groups,
+                report.near_groups,
                 report.muted,
                 report.already_muted,
                 report.largest_group,

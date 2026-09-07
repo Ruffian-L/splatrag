@@ -3,6 +3,7 @@ use crate::packet::{MemoryPacket, VqCodebook};
 use crate::physics::domain_state_color;
 use crate::record::RecallFilters;
 use crate::service::{MemoryService, MemoryStatus, SteerAddress, SteerOpts, SteerReport};
+use crate::sidecar::SidecarState;
 use crate::wire::{WireBasin, WireMemoryRecord, WireRecallHit};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -162,6 +163,7 @@ pub async fn serve(service: Arc<MemoryService>) -> anyhow::Result<()> {
         .route("/api/basins", get(basins))
         .route("/api/splats", get(splats))
         .route("/api/memories/:id", get(memory))
+        .route("/api/sidecar/:id", get(sidecar_get).put(sidecar_put))
         .route("/api/search", get(search))
         // gain inverts/amplifies semantics; mass (if set negative) repels — independent knobs
         .route("/api/steer", post(steer))
@@ -347,6 +349,24 @@ async fn memory(
         Some(memory) => Json(WireMemoryRecord::from(&memory)).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
     })
+}
+
+async fn sidecar_get(
+    State(service): State<Arc<MemoryService>>,
+    Path(id): Path<String>,
+) -> Result<Json<SidecarState>, ApiError> {
+    let id = Uuid::parse_str(&id)?;
+    Ok(Json(service.sidecar_get(id)))
+}
+
+async fn sidecar_put(
+    State(service): State<Arc<MemoryService>>,
+    Path(id): Path<String>,
+    Json(state): Json<SidecarState>,
+) -> Result<Json<SidecarState>, ApiError> {
+    let id = Uuid::parse_str(&id)?;
+    service.sidecar_put(id, state)?;
+    Ok(Json(service.sidecar_get(id)))
 }
 
 async fn search(

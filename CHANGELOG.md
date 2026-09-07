@@ -2,6 +2,120 @@
 
 User-facing changes to the SplatRAG engine. Lab notes stay local.
 
+## 2026-09-03 — Push main: lookup, sidecar, near-dupe mute
+
+We did: scoped commit of this session (lookup_text / thread-start skip, near-dupe mute, sidecar PassThrough, muted recall skip, chunk-geometry series scripts). Pushed local `main` to `origin` as a new GitHub branch. Left `memory-ingest` alone. Did not add service.rs auth/ingest/hydrate WIP, vendor, or compact-lexical. Did not restart serve.
+
+We think: GitHub still only had the July 30 `memory-ingest` tree; `main` is the v3 engine that has been running here.
+
+Next: compact-lexical on personal after a new binary, then recount judge hits.
+
+- Research: `research_logs/2026-09-03_push-main-viewer.md`
+- Agent: Grok (xAI)
+
+## 2026-09-03 — Strip thread-start noise in lookup, not in cold
+
+We did: the website garbage is harness preambles, not user+assistant pairs. Heads: 13577 judge, 3750 HARD OUTPUT RULES, 476 Codex transcript dumps, 232 collaborator dumps, 81 `<user_info>`. Cold stays byte-for-byte. `lookup_text` now: skip whole judge/HARD/risk_level/folder-runner rows; `<user_query>` keeps the ask; transcript wrappers keep the first `[n] user:` line. Recall skips `muted`. Tests 6/6 in `lookup.rs`. Did not compact-lexical the 128k store. Did not re-embed.
+
+We think: clustering clones without stripping lookup is why quality would drop — BM25 still ranks 13k identical heads. Derived index sees the ask; cold keeps the noise.
+
+Next: `compact-lexical` on personal after a new binary, then recount judge hits on a probe query.
+
+- Research: `research_logs/2026-09-03_strip-thread-noise.md`
+- Agent: Grok (xAI)
+
+## 2026-09-03 — Near-dupe mute: judge clones were not byte-identical
+
+We did: counted why the field still looks duplicated. Cold 128211; byte-identical extra 33837 (already muted, 33637 flags); unique sha 94374 ≈ 94574 painted. Prefix clones **not** same sha: 13577 “strict dataset judge…”, 3750 “HARD OUTPUT RULES…”, plus 11924 unmuted unassigned. Exact `content_sha256` mute cannot see those. Added prefix collapse (first 160 normalized chars, group ≥ 8) in `dedupe.rs`. `POST /api/recolor` now runs collapse then persist. Tests: exact mute, near mute, short chats stay. Did not dream. Did not delete cold. Lookup contract (`src/lookup.rs`) is separate: human rows stay in BM25.
+
+We think: the soup is boilerplate clones with different tails, not user+assistant pairs.
+
+Next: rebuild the serve binary and `POST /api/recolor` so the 13k judge clump leaves the picture.
+
+- Research: `research_logs/2026-09-03_near-dupe-mute.md`
+- Agent: Grok (xAI)
+
+## 2026-09-03 — Durable lookup is cold→tantivy+HNSW, not sidecar
+
+We did: named the contract in `src/lookup.rs`. Cold row with text is the lookup document. Speaker is a query filter, never an index skip. Lexical add now goes through `is_indexable` / `lookup_text`. Test: rebuild with human+collaborator, “shift click window” hits the human id. Did not change the 128k store.
+
+We think: that is the durable index from the n=250 series. Sidecar is belief. Glue is pollution.
+
+- Research: `research_logs/2026-09-03_durable-lookup-index.md`
+- Agent: Grok (xAI)
+
+## 2026-09-03 — Chunk geometry series n=250 (lookup needs searchable user text)
+
+We did: `scripts/chunk_geometry_series.py` on 250 adjacent human→assistant pairs from cold `memories.jsonl` (seed 20260903, 170 convos, 80 with 2 pairs). 750 embeds on `:8081`. T1–T7 ranks/cosines, no HIT/MISS, no pass rate. Did not write the store. Did not concat ingest.
+
+Receipts (`research_logs/2026-09-03_chunk-geometry-series.json`): T1 pollution Δ mean **+0.226**. T2 user-query vs assistant pool mean rank **32.4** / median **9** of 250. T3 vs concat pool median **1**. T4 vs user-row pool **1** (verbatim). T6 lex on assistant docs median **38**; on concat **1**; on user docs **1**. T7 convo intra−inter concat 0.202 vs assistant 0.184. Queries were the user/assistant strings themselves, not paraphrases.
+
+We think: lookup needs the user turn **searchable**. Metadata that is not indexed is T2/T6-assistant (miss). Glue into the assistant embed (concat) buys T3/T6-concat and costs T1. Two rows (current) is T4/T6-user without moving the assistant splat.
+
+Next: paraphrase queries if we want a harder lookup cell. Not a second concat ingest.
+
+- Research: `research_logs/2026-09-03_chunk-geometry-series.md`
+- Agent: Grok (xAI)
+
+## 2026-09-03 — Grade: do not concat; keep one turn one splat
+
+We did: post-hoc read of `2026-09-03_chunk-geometry-ab.json` (not a runner verdict). Concat topic-gap 0.289 vs assistant-only 0.243 is circular — topics were the user questions. niodoo-1: user→assistant 0.409, user→concat 0.632 (splat moved ~0.22 toward the prompt). Ingest already emits two records (`streams_claude_array_and_preserves_two_messages`); strengthened that test so glued `User:\nAssistant:` is illegal. Did not re-ingest. Did not concat the 128k store.
+
+We think: concat is worse for this memory system. Dropping user rows (assistant-only + metadata) is also worse here — Jason’s questions are memories. Right geometry is what ingest already does: one speaker, one row, stitch `conversation_id`+`turn_index`.
+
+Next: leave ingest. Scratch silo concat is not unpaid work.
+
+- Research: `research_logs/2026-09-03_chunk-geometry-grade.md`
+- Agent: Grok (xAI)
+
+## 2026-09-03 — Chunk geometry A/B (concat vs assistant-only)
+
+We did: wrote `scripts/chunk_geometry_ab.py` + frozen 9 pairs (3 towel / 3 niodoo / 3 desktop) in `research_logs/2026-09-03_chunk-geometry-pairs.json`. Live Qwen3 embedder `:8081`, 4096-d. Arm A = embed(`User:`+`Assistant:`). Arm B = embed(assistant); user not in the vector. Topic labels never entered the embed. No verdict column. Did not write the personal store. Did not re-ingest.
+
+Receipts (`research_logs/2026-09-03_chunk-geometry-ab.json`): topic intra−inter cosine concat **0.289**, assistant-only **0.243**, user-only **0.257**. Mean user→own concat  vs user→own assistant printed in the log. n=9 is a toy cloud, not a basin of the 128k store.
+
+We think: this is the first number on the two chunkings. It does not say which to ship.
+
+Next: same script on more pairs, or a scratch silo that actually ingests B, then list_basins. Not a win-rate.
+
+- Research: `research_logs/2026-09-03_chunk-geometry-ab.md`
+- Agent: Grok (xAI)
+
+## 2026-09-03 — Epistemic sidecar: belief ≠ evidence
+
+We did: added `src/sidecar.rs`. A splat is frozen evidence (`MemoryRecord.text` → embed). Sidecar is belief about that evidence: authority, status (active/superseded/retracted), validity interval, superseded_by. Stored at `{data_dir}/sidecar/epistemic.json`, sparse, point-updated. `PUT /api/sidecar/:id` and `inspect` now show it. Default policy is **PassThrough** so SciFact / freeze ranking does not move. CurrentProduction drops superseded/retracted; HistoricalResearch keeps superseded if `t` is in interval. Low authority penalizes; retract drops. Tests: 9 sidecar unit tests, including “write does not change text or content_sha256”. Did not re-embed. Did not concatenate status into chunks. Did not change hybrid fusion.
+
+We think: semantic identity stays still while epistemic state can evolve. Geometry answers what matches; sidecar answers what is admissible.
+
+Next: only flip `sidecar_set_policy(CurrentProduction)` on a scratch silo. Do not turn it on personal until a dated analysis pass.
+
+- Research: `research_logs/2026-09-03_epistemic-sidecar.md`
+- Agent: Grok (xAI)
+
+## 2026-09-01 — Embedder fell to CPU; restored GPU, cleared derived-index drift
+
+We did: found `splatrag-embed.service` had started with
+`ggml_cuda_init: failed to initialize CUDA: unknown error` and silently ran the
+8B Q4_K_M embedder on CPU (a 3-doc embed took ~19s, ~206% CPU, no entry in
+`nvidia-smi` compute-apps). Restarted the unit once CUDA was confirmed working
+(probe: GB10 cc=12.1); embed dropped to ~0.1s and now shows 10.5 GiB GPU.
+Also cleared a derived-index drift the last CPU-era ingest left behind: cold
+store had 128210 memories but HNSW/hot only 127188 (a 1022 gap → recall was
+missing them). Ran `backfill-derived` with the service stopped (avoids the
+two-mutator lock hang), which embedded the 1022 into HNSW/hot. `run doctor`
+now passes: cold=hnsw=splats=128210, pending_derived=false, dream_cycle 27
+preserved. Restarted serve. Did not change model config, code, memories, or
+dream geometry.
+- Research: `research_logs/2026-09-01_cpu-embedder-and-derived-index-drift.md`
+- Agent: opencode
+
+## 2026-08-31 — Ship product claim contract
+
+- Ship the claim contract alongside the product surface
+- Hypothesis: A single scoped claim contract will keep the 60k stress observation distinct from the reproducible poison handshake and make the repo shippable without overstating evidence.
+- Research: `research/logs/2026-08-31_ship-product-claim-contract.md`
+- Agent: Codex
+
 ## 2026-08-30 — Clear saturated embed queue and restore MCP recall
 
 We did: restarted `splatrag-embed.service` and `splatrag-personal-serve.service`
@@ -18,6 +132,13 @@ Next: identify which caller submits multi-thousand-token embedding requests and
 bound or chunk those requests before they can monopolize all four embed slots.
 
 Research: `research_logs/2026-08-30_clear-saturated-embed-queue.md`
+
+## 2026-08-29 — Repair derived-index drift + basin topology + stale-guard fix
+
+- **Operational repair:** Stopped `splatrag-cli-sessions-watch.service` + `splatrag-personal-serve.service`, moved stale `hnsw.index` (1,033 keys) aside, ran `hydrate-ann` out-of-cgroup via `systemd-run --user --scope` (added 121,181 keys), restarted serve, triggered dream with capped topology (`basin_max_members=5000`). Golden basin split: **1 → 1,723 basins**, dream cycle 26 → 27.
+- **Durable code fix:** Added ANN stale guard in `persist_hot_and_ann()` (service.rs:1416–1429). Mirrors the existing hot-state `dream_cycle` guard: snapshots on-disk ANN key count before save, refuses overwrite if `on_disk_keys > in_memory_keys`. Prevents ingest/serve from clobbering a fresh hydrate with a stale ~969-key graph.
+- Watcher re-enabled; ingest now grows ANN correctly (hnsw_keys 121,181 → 121,309 after restart).
+- Research: `research_logs/2026-08-29_repair-derived-index-drift-and-basin-topology.md`
 
 ## 2026-08-29 — Controlled A/B: basin cap + mutual-kNN topology
 

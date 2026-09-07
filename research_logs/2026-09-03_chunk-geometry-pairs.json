@@ -1,0 +1,69 @@
+{
+  "protocol": "chunk-geometry-ab-v1",
+  "note": "Frozen dialogue pairs. topic is analysis-only, never concatenated into an embed. Arm A embeds user+assistant. Arm B embeds assistant; user is metadata.",
+  "pairs": [
+    {
+      "id": "towel-1",
+      "topic": "towel",
+      "source": "splat:c478da6e-b474-5cc6-8f3a-cfad9685ad42",
+      "user": "i have a problem i have 1 towel it gonna take me 5 hours to dry, but my friends jsut gave me 4 more towels, how long is it going to take me to dry all the towels?",
+      "assistant": "A simple problem, but let me see. It's not just about the number of towels, but how long it takes to dry each one. Since it takes 5 hours to dry one towel, adding more towels doesn't change the time it takes to dry each one. So with 5 towels it is still 5 hours, because they dry in parallel."
+    },
+    {
+      "id": "towel-2",
+      "topic": "towel",
+      "source": "splat:302eab07-a3ba-5b06-bef2-3ef725c23c52",
+      "user": "It takes 1 hour to dry one towel outside in the sun. How long to dry 50 towels at once under the same sun? Answer first, then one sentence why.",
+      "assistant": "It still takes 1 hour. All fifty towels see the same sun at the same time, so count does not multiply the drying clock."
+    },
+    {
+      "id": "towel-3",
+      "topic": "towel",
+      "source": "splat:6e2a95e9-7c48-5a41-9c77-a93786ef14a8",
+      "user": "It takes 1 hour to dry one towel on a sunny clothesline. How long does it take to dry 50 towels under the same conditions?",
+      "assistant": "One hour. Parallel drying: the line holds every towel in the same weather, so 50 is not 50 hours."
+    },
+    {
+      "id": "niodoo-1",
+      "topic": "niodoo",
+      "source": "splat:e72cb1b8-dbd0-5b5c-87f5-a418a5aadccf",
+      "user": "I made CoT without CoT no hedge gas no brakes back in December 2025 thats me",
+      "assistant": "Dec 16 2025 a19f38d3 v1.0 Gold Master: Niodoo is a physics-based inference controller. Rather than relying on prompt engineering, chain-of-thought techniques, or fine-tuning, it treats the hidden state trajectory as a dynamical system governed by gravitational forces."
+    },
+    {
+      "id": "niodoo-2",
+      "topic": "niodoo",
+      "source": "splat:e72cb1b8 neighbor",
+      "user": "look how thats typed, you think i typed that up? lol i sucked at github. people called it slop so i wanted to fix things. i had no access to github for a month, thats why i had to rebuild, i didnt have the code",
+      "assistant": "You're right — that's not your typing. And the git-history thing is checkable. Let me date the blackout."
+    },
+    {
+      "id": "niodoo-3",
+      "topic": "niodoo",
+      "source": "splat:e72cb1b8 body",
+      "user": "Niodoo treats hidden state as physics not chain of thought. Layer banding ghost vector. What is it not?",
+      "assistant": "Not fine-tuning, no weight modification. Not prompt engineering, works on hidden states. Not a sampler replacement, works before sampling. Layer banding 16-31. Ghost vector. Mechanism first."
+    },
+    {
+      "id": "desktop-1",
+      "topic": "desktop",
+      "source": "this-session window bind",
+      "user": "grok how can i shift-click to move any window i want",
+      "assistant": "On this GNOME box you grab any window from anywhere with Super plus left-drag. mouse-button-modifier is Super. Shift-click fights text selection."
+    },
+    {
+      "id": "desktop-2",
+      "topic": "desktop",
+      "source": "splat:d13e5e65-f29e-5cf9-8b1b-230e28488f6d",
+      "user": "Optimze my system for peromfance, for vram ml work flows. im also swithivng to kde",
+      "assistant": "I'll start with a read-only audit of the GPU, drivers, distro, memory/swap, storage, and current desktop. Then a scoped set of changes, system-level mutations only with approval."
+    },
+    {
+      "id": "desktop-3",
+      "topic": "desktop",
+      "source": "this-session store 401",
+      "user": "how come my main view of the store not working",
+      "assistant": "The store was never down. 128211 memories. The picture is 5173. Vite /lens proxy had no Bearer token so /api/splats returned 401 Loading full store."
+    }
+  ]
+}

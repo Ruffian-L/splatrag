@@ -1304,6 +1304,15 @@ mod tests {
         assert_eq!(report.emitted, 2);
         assert_eq!(records[0].conversation_id.as_deref(), Some("c1"));
         assert_eq!(records[1].parent_id.as_deref(), Some("m1"));
+        assert_eq!(records[0].speaker.as_deref(), Some("human"));
+        assert_eq!(records[1].speaker.as_deref(), Some("collaborator"));
+        assert_eq!(records[0].text, "hello");
+        assert_eq!(records[1].text, "world");
+        let glued = format!("User: {}\nAssistant: {}", records[0].text, records[1].text);
+        assert_ne!(records[0].text, glued);
+        assert_ne!(records[1].text, glued);
+        assert!(!records[0].text.contains("world"));
+        assert!(!records[1].text.contains("hello"));
     }
 
     #[test]

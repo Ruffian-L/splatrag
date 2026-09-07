@@ -1,0 +1,136 @@
+{
+  "protocol": "chunk-geometry-ab-v1",
+  "generated_at": "2026-09-03T11:19:03.733505+00:00",
+  "embed_url": "http://127.0.0.1:8081/v1/embeddings",
+  "n_pairs": 9,
+  "topics": [
+    "desktop",
+    "niodoo",
+    "towel"
+  ],
+  "arms": {
+    "A_concat": "embed(User: \u2026\\nAssistant: \u2026) \u2014 one chunk",
+    "B_assistant_only": "embed(assistant); user held as metadata, not in the vector"
+  },
+  "note": "No verdict. intra-inter is whether the cloud separates by topic label. Jason grades.",
+  "rows": [
+    {
+      "id": "towel-1",
+      "topic": "towel",
+      "source": "splat:c478da6e-b474-5cc6-8f3a-cfad9685ad42",
+      "user_chars": 162,
+      "assistant_chars": 292,
+      "cos_user_to_concat": 0.8864819671392822,
+      "cos_user_to_assistant": 0.8431720307722985,
+      "cos_assistant_to_concat": 0.8787929729817652
+    },
+    {
+      "id": "towel-2",
+      "topic": "towel",
+      "source": "splat:302eab07-a3ba-5b06-bef2-3ef725c23c52",
+      "user_chars": 143,
+      "assistant_chars": 119,
+      "cos_user_to_concat": 0.9106160905023443,
+      "cos_user_to_assistant": 0.8899895197145171,
+      "cos_assistant_to_concat": 0.9033430503853325
+    },
+    {
+      "id": "towel-3",
+      "topic": "towel",
+      "source": "splat:6e2a95e9-7c48-5a41-9c77-a93786ef14a8",
+      "user_chars": 122,
+      "assistant_chars": 97,
+      "cos_user_to_concat": 0.9330478848859372,
+      "cos_user_to_assistant": 0.8259357038291392,
+      "cos_assistant_to_concat": 0.8763729557089651
+    },
+    {
+      "id": "niodoo-1",
+      "topic": "niodoo",
+      "source": "splat:e72cb1b8-dbd0-5b5c-87f5-a418a5aadccf",
+      "user_chars": 76,
+      "assistant_chars": 268,
+      "cos_user_to_concat": 0.632079199527163,
+      "cos_user_to_assistant": 0.4092996743810852,
+      "cos_assistant_to_concat": 0.917054534307042
+    },
+    {
+      "id": "niodoo-2",
+      "topic": "niodoo",
+      "source": "splat:e72cb1b8 neighbor",
+      "user_chars": 210,
+      "assistant_chars": 104,
+      "cos_user_to_concat": 0.9041899774992824,
+      "cos_user_to_assistant": 0.5707914633568989,
+      "cos_assistant_to_concat": 0.796281533713224
+    },
+    {
+      "id": "niodoo-3",
+      "topic": "niodoo",
+      "source": "splat:e72cb1b8 body",
+      "user_chars": 103,
+      "assistant_chars": 190,
+      "cos_user_to_concat": 0.8990572381624179,
+      "cos_user_to_assistant": 0.7123668867630895,
+      "cos_assistant_to_concat": 0.7917408017147783
+    },
+    {
+      "id": "desktop-1",
+      "topic": "desktop",
+      "source": "this-session window bind",
+      "user_chars": 52,
+      "assistant_chars": 145,
+      "cos_user_to_concat": 0.8432514237855654,
+      "cos_user_to_assistant": 0.7581672904620158,
+      "cos_assistant_to_concat": 0.9030648551543133
+    },
+    {
+      "id": "desktop-2",
+      "topic": "desktop",
+      "source": "splat:d13e5e65-f29e-5cf9-8b1b-230e28488f6d",
+      "user_chars": 82,
+      "assistant_chars": 178,
+      "cos_user_to_concat": 0.908621748885385,
+      "cos_user_to_assistant": 0.6282134180731516,
+      "cos_assistant_to_concat": 0.6457450409021752
+    },
+    {
+      "id": "desktop-3",
+      "topic": "desktop",
+      "source": "this-session store 401",
+      "user_chars": 46,
+      "assistant_chars": 148,
+      "cos_user_to_concat": 0.7755669235566962,
+      "cos_user_to_assistant": 0.6364501948956176,
+      "cos_assistant_to_concat": 0.8944450819185935
+    }
+  ],
+  "cluster_concat": {
+    "n_intra_pairs": 9,
+    "n_inter_pairs": 27,
+    "mean_intra_cos": 0.5292730435694843,
+    "mean_inter_cos": 0.24060263783049737,
+    "intra_minus_inter": 0.28867040573898695
+  },
+  "cluster_assistant_only": {
+    "n_intra_pairs": 9,
+    "n_inter_pairs": 27,
+    "mean_intra_cos": 0.5135102318775774,
+    "mean_inter_cos": 0.2704296309562955,
+    "intra_minus_inter": 0.24308060092128186
+  },
+  "cluster_user_only": {
+    "n_intra_pairs": 9,
+    "n_inter_pairs": 27,
+    "mean_intra_cos": 0.5792542646649452,
+    "mean_inter_cos": 0.3220147280998144,
+    "intra_minus_inter": 0.2572395365651308
+  },
+  "user_query_to_other_chunks": {
+    "concat_same_topic_mean": 0.5391495957965339,
+    "concat_other_topic_mean": 0.2727353730928603,
+    "assistant_same_topic_mean": 0.5458315721900089,
+    "assistant_other_topic_mean": 0.2896405244390217
+  },
+  "dim": 4096
+}

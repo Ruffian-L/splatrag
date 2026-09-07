@@ -143,9 +143,15 @@ impl LexicalIndex {
         let conversation_id = schema.get_field("conversation_id")?;
         let mut writer = self.index.writer(heap_bytes)?;
         for record in records {
+            if !crate::lookup::is_indexable(record) {
+                continue;
+            }
+            // Upsert by stable UUID. This makes crash recovery safe: replaying a
+            // pending derived transaction cannot duplicate the lexical document.
+            writer.delete_term(Term::from_field_text(self.id, &record.id.to_string()));
             writer.add_document(doc!(
                 self.id => record.id.to_string(),
-                self.text => record.text.clone(),
+                self.text => crate::lookup::lookup_text(record).to_string(),
                 domain => record.domain.clone(),
                 model => record.model.clone().unwrap_or_default(),
                 conversation_id => record.conversation_id.clone().unwrap_or_default(),

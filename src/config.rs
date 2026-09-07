@@ -471,6 +471,11 @@ impl AppConfig {
         self.data_dir.join("hot").join("state.json")
     }
 
+    /// Epistemic sidecar. Not cold text. Point-updates must not re-embed.
+    pub fn sidecar_path(&self) -> PathBuf {
+        self.data_dir.join("sidecar").join("epistemic.json")
+    }
+
     pub fn packed_geometry_path(&self) -> PathBuf {
         self.data_dir.join("hot").join("geometry.bin")
     }
